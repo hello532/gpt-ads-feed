@@ -1,0 +1,51 @@
+# ── 凭证与真实配置：绝对不进仓 ──────────────────────────────
+# 只有 *.example 模板允许提交
+config.json
+config.*.json
+!config.example.json
+env
+.env
+.env.*
+*.env
+!env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+known_hosts
+
+# ── 运行产物 ────────────────────────────────────────────────
+out/
+output/
+*.jsonl
+*.jsonl.gz
+*.csv.gz
+*.tsv.gz
+*.parquet
+*.partial
+*.tmp
+state.json
+last_run.json
+
+# ── 日志 ────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 已安装的 launchd 副本（含真实绝对路径，模板才进仓）──────
+com.user.gpt-ads-feed.installed.plist
+
+# ── 工具与系统 ──────────────────────────────────────────────
+.claude/
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  安装：
+    cp com.user.gpt-ads-feed.plist ~/Library/LaunchAgents/
+    # 把下面的 __PROJECT_DIR__ 换成实际路径
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.gpt-ads-feed.plist
+    launchctl kickstart -p gui/$(id -u)/com.user.gpt-ads-feed   # 立刻跑一次
+  卸载：
+    launchctl bootout gui/$(id -u)/com.user.gpt-ads-feed
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.gpt-ads-feed</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__PROJECT_DIR__/run_daily.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <!-- 每天 07:20 本地时间跑全量快照 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>20</integer>
+    </dict>
+
+    <!-- 到点机器在睡觉时，醒来补跑一次 -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/gpt-ads-feed/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/gpt-ads-feed/launchd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

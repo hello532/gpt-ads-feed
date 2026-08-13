@@ -1,0 +1,68 @@
+{
+  "//": "复制成 config.json 再改。凭证一律不放这里，放 env 文件（见 env.example）。",
+  "//keys": "键名必须和这里一致；写错的键会被静默忽略，改完可先跑 --dry-run 核对产出。",
+
+  "shop_domain": "your-store.myshopify.com",
+  "api_version": "2026-04",
+  "page_size": 100,
+
+  "seller_name": "Your Store",
+  "seller_url": "https://your-store.com",
+  "return_policy": "https://your-store.com/policies/refund-policy",
+  "return_deadline_in_days": 30,
+  "accepts_returns": true,
+  "default_brand": "YourBrand",
+
+  "store_country": "US",
+  "target_countries": ["US"],
+  "currency_override": "",
+
+  "is_eligible_search": true,
+  "is_eligible_checkout": false,
+  "is_ads_eligible": true,
+  "//checkout": "开 is_eligible_checkout 就必须再填 seller_privacy_policy 与 seller_tos",
+  "seller_privacy_policy": "",
+  "seller_tos": "",
+
+  "output_path": "out/products.jsonl.gz",
+  "output_format": "jsonl.gz",
+  "//output_format": "parquet(需 pyarrow) / jsonl.gz / csv.gz / tsv.gz；官方优先推荐 parquet",
+  "remote_filename": "products.jsonl.gz",
+  "//remote_filename": "后缀必须与 output_format 一致，摄取端按后缀选解析器",
+  "shard_count": 1,
+  "//shard_count": "单分片够用；>50 万行再分。分片集合要跨次稳定，别随意改这个数",
+  "state_path": "out/.state.json",
+  "rejects_path": "out/rejects.csv",
+
+  "exclude_tags": ["hidden", "no-feed"],
+  "min_price": 0,
+  "condition": "new",
+  "age_group": "",
+  "gender": "",
+  "age_restriction": null,
+  "warning": "",
+
+  "prefer_seo_description": true,
+  "emit_additional_images": true,
+  "max_additional_images": 10,
+
+  "oversell_availability": "backorder",
+  "//oversell_availability": "库存 <=0 但策略是 CONTINUE 时怎么报：in_stock / backorder / pre_order",
+  "backorder_restock_days": null,
+  "preorder_lead_days": null,
+  "//preorder_lead_days": "报 pre_order 必须能算出 availability_date，所以这项要给正整数",
+
+  "min_rows": 1,
+  "//min_rows": "产出行数低于此值就拦停，防止 Shopify 抽风时用空快照清空整个目录",
+  "max_reject_ratio": 0.35,
+  "skip_upload_when_unchanged": false,
+  "//skip_upload_when_unchanged": "默认 false：规范建议至少每天投一次全量，即使内容没变",
+  "delta_include_title": false,
+  "//delta_include_title": "Delta API 只能改库存与标题；标题很少变，默认只推库存",
+
+  "//metafields": "把 Shopify metafield 映射到规范字段：\"规范字段\": \"namespace.key\"。左边必须是规范字段名，否则启动即报错。用不到就留空 {}",
+  "metafields": {
+    "material": "custom.material",
+    "gtin": "custom.gtin"
+  }
+}
