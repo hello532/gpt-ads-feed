@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""端到端：把 Shopify 网络层换成假数据，真跑 run()/_publish()/上传/Delta 编排。
+"""End to end: swap the Shopify network layer for fake data and really run run()/_publish()/upload/Delta.
 
-跟 feed_sync.py --self-test 的分工：自检查单个函数，这里查整条链路
-（配置加载 → 抓取 → 映射 → 校验 → 分片落盘 → 状态对比 → 上传/Delta → 报告）。
+Division of labour with feed_sync.py --self-test: the self-test checks individual functions,
+this checks the whole chain (config load -> fetch -> map -> validate -> shard to disk ->
+state diff -> upload/Delta -> report).
 
-不碰真凭证、不出网、产物只写临时目录。跑法：
+No real credentials, no network, and output only goes to a temp directory. Run with:
     python3 -B tests/test_e2e.py
-退出码非 0 即失败。
+A non-zero exit code means failure.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SRC = Path(os.environ.get("FEED_SRC") or (HERE.parent / "feed_sync.py"))
 if not SRC.exists():
-    sys.exit(f"找不到 feed_sync.py（试过 {SRC}），可用 FEED_SRC 指定")
+    sys.exit(f"feed_sync.py not found (tried {SRC}); set FEED_SRC to point at it")
 TMP_ROOT = Path(tempfile.mkdtemp(prefix="feed-e2e-"))
 
 spec = importlib.util.spec_from_file_location("feed_sync", SRC)
@@ -48,7 +49,7 @@ def eq(got, want, label: str) -> None:
     ok(got == want, f"{label}: got {got!r}, want {want!r}")
 
 
-# ---------- 假店铺数据 ----------
+# ---------- Fake shop data ----------
 
 def variant(i: int, *, price="19.90", avail=True, title=None, pid=None, qty=5):
     pid = pid if pid is not None else 900 + i
@@ -146,7 +147,7 @@ def read_jsonl_gz(p: Path) -> list[dict]:
 
 
 def capture(fn):
-    """吃掉 log 输出（走 stdout），只留返回值，便于摘要干净。"""
+    """Swallow log output (it goes to stdout) and keep only the return value, so the summary stays clean."""
     buf = io.StringIO()
     old, sys.stdout = sys.stdout, buf
     try:
@@ -154,52 +155,52 @@ def capture(fn):
     finally:
         sys.stdout = old
 def case_dry_run(work: Path) -> None:
-    """dry-run：出文件、不上传、不写状态。"""
+    """dry-run: produce the file, do not upload, do not write state."""
     calls = Calls()
     patch(make_rows(6), calls)
     cfg = write_cfg(work)
     rc, out = capture(lambda: fs.run(args(cfg, dry_run=True)))
-    eq(rc, fs.EXIT_OK, "dry-run 退出码 0")
-    ok(not calls.uploads, "dry-run 没上传")
-    ok(not (work / "state.json").exists(), "dry-run 没写状态")
+    eq(rc, fs.EXIT_OK, "dry-run exit code 0")
+    ok(not calls.uploads, "dry-run did not upload")
+    ok(not (work / "state.json").exists(), "dry-run did not write state")
     rows = read_jsonl_gz(work / "feed.jsonl.gz")
-    eq(len(rows), 6, "6 个变体出 6 行")
-    ok("dry-run" in out, "日志里说明了 dry-run")
+    eq(len(rows), 6, "6 variants produce 6 rows")
+    ok("dry-run" in out, "the log says it was a dry-run")
 
     r = rows[0]
-    # compareAtPrice=29.99 > price=19.90 → 规范口径是 price 放原价、sale_price 放现价
-    eq(r["price"], "29.99 USD", "打折时 price 放原价并带币种")
-    eq(r["sale_price"], "19.90 USD", "打折时 sale_price 放现价")
-    eq(r["is_eligible_search"], "true", "默认可被搜索")
-    eq(r["is_eligible_checkout"], "false", "未开 checkout")
-    eq(r["is_ads_eligible"], "true", "开了 ads")
-    ok("is_ads_enabled" not in r, "不写非法字段 is_ads_enabled")
-    ok("inventory_quantity" not in r, "不写规范外字段 inventory_quantity")
-    ok(r["item_id"] and r["group_id"], "item_id/group_id 都在")
-    ok(r["additional_image_urls"], "附图字段用复数形式")
-    ok("<" not in r["description"], "描述已去 HTML")
+    # compareAtPrice=29.99 > price=19.90 -> per the spec price holds the list price and sale_price the current one
+    eq(r["price"], "29.99 USD", "on a discount price holds the list price and carries a currency")
+    eq(r["sale_price"], "19.90 USD", "on a discount sale_price holds the current price")
+    eq(r["is_eligible_search"], "true", "searchable by default")
+    eq(r["is_eligible_checkout"], "false", "checkout is off")
+    eq(r["is_ads_eligible"], "true", "ads is on")
+    ok("is_ads_enabled" not in r, "the illegal field is_ads_enabled is not written")
+    ok("inventory_quantity" not in r, "the out-of-spec field inventory_quantity is not written")
+    ok(r["item_id"] and r["group_id"], "item_id and group_id are both present")
+    ok(r["additional_image_urls"], "the extra-image field uses the plural form")
+    ok("<" not in r["description"], "the description has had its HTML stripped")
     unknown = set(r) - set(fs.FEED_COLUMNS)
-    eq(unknown, set(), "产出列都在规范内")
+    eq(unknown, set(), "every produced column is within the spec")
 
 
 def case_full_cycle(work: Path) -> None:
-    """首轮全量上传 + 写状态；次轮改库存后走 Delta。"""
+    """First round uploads the full snapshot and writes state; the second round changes stock and goes through Delta."""
     calls = Calls()
     rows = make_rows(5)
     patch(rows, calls)
     cfg = write_cfg(work)
 
     rc, _ = capture(lambda: fs.run(args(cfg, delta=True)))
-    eq(rc, fs.EXIT_OK, "首轮退出码 0")
-    eq(len(calls.uploads), 1, "首轮上传一次")
-    eq(calls.uploads[0][1], ["products.jsonl.gz"], "单分片用裸文件名")
-    ok(not calls.deltas, "首轮没基线，不推 Delta")
+    eq(rc, fs.EXIT_OK, "first round exit code 0")
+    eq(len(calls.uploads), 1, "the first round uploads once")
+    eq(calls.uploads[0][1], ["products.jsonl.gz"], "a single shard uses the bare filename")
+    ok(not calls.deltas, "with no baseline the first round pushes no Delta")
     st = json.loads((work / "state.json").read_text(encoding="utf-8"))
-    eq(len(st["items"]), 5, "状态记了 5 条")
-    eq(st["version"], fs.STATE_VERSION, "状态带版本号")
+    eq(len(st["items"]), 5, "state recorded 5 rows")
+    eq(st["version"], fs.STATE_VERSION, "state carries a version number")
     first_sha = st["content_sha256"]
 
-    # 第 2 轮：1 条断货、1 条改价，其余不变
+    # Round 2: one row out of stock, one row repriced, the rest unchanged
     rows2 = make_rows(5)
     rows2[0]["availableForSale"] = False
     rows2[0]["inventoryQuantity"] = 0
@@ -207,20 +208,21 @@ def case_full_cycle(work: Path) -> None:
     calls2 = Calls()
     patch(rows2, calls2)
     rc, out = capture(lambda: fs.run(args(cfg, delta=True)))
-    eq(rc, fs.EXIT_OK, "次轮退出码 0")
-    eq(len(calls2.uploads), 1, "内容变了照常全量上传")
-    eq(len(calls2.deltas), 1, "推了一次 Delta")
+    eq(rc, fs.EXIT_OK, "second round exit code 0")
+    eq(len(calls2.uploads), 1, "changed content still uploads the full snapshot")
+    eq(len(calls2.deltas), 1, "Delta was pushed once")
     prods = calls2.deltas[0]
-    eq(len(prods), 1, "只有断货那条进 Delta")
+    eq(len(prods), 1, "only the out-of-stock row goes into Delta")
     v = prods[0]["variants"][0]
     eq(v["availability"], {"available": False, "status": "out_of_stock"},
-       "availability 是对象，且 available/status 一致")
-    ok("price" not in v, "Delta 不带价格字段")
-    ok("改了价格" in out and "不支持价格" in out, "日志提醒改价只能靠全量")
+       "availability is an object, and available/status agree")
+    ok("price" not in v, "Delta carries no price field")
+    ok("changed price" in out and "does not support price" in out,
+       "the log points out that a price change only takes effect through the full snapshot")
     st2 = json.loads((work / "state.json").read_text(encoding="utf-8"))
-    ok(st2["content_sha256"] != first_sha, "内容指纹随数据变化")
+    ok(st2["content_sha256"] != first_sha, "the content fingerprint follows the data")
 def case_unchanged(work: Path) -> None:
-    """字节完全一致时：默认照传，配置打开才跳过。"""
+    """When the bytes are identical: deliver anyway by default, skip only when configured to."""
     calls = Calls()
     rows = make_rows(4)
     patch(rows, calls)
@@ -231,22 +233,23 @@ def case_unchanged(work: Path) -> None:
     calls2 = Calls()
     patch(make_rows(4), calls2)
     rc, out = capture(lambda: fs.run(args(cfg)))
-    eq(rc, fs.EXIT_OK, "重跑退出码 0")
-    eq(len(calls2.uploads), 1, "默认「至少每天一次」照常上传")
-    ok("仍按" in out or "照常投递" in out, "日志说明了为什么还传")
+    eq(rc, fs.EXIT_OK, "rerun exit code 0")
+    eq(len(calls2.uploads), 1, 'by default "at least once a day" uploads regardless')
+    ok("still delivering" in out or "at least once a day" in out,
+       "the log explains why it delivered anyway")
     sha2 = json.loads((work / "state.json").read_text(encoding="utf-8"))["content_sha256"]
-    eq(sha2, sha1, "同样输入产出同样指纹（gzip 确定性）")
+    eq(sha2, sha1, "the same input produces the same fingerprint (gzip is deterministic)")
 
     calls3 = Calls()
     patch(make_rows(4), calls3)
     cfg2 = write_cfg(work, skip_upload_when_unchanged=True)
     rc, out = capture(lambda: fs.run(args(cfg2)))
-    eq(rc, fs.EXIT_OK, "跳传模式退出码 0")
-    ok(not calls3.uploads, "打开开关后内容未变就不传")
+    eq(rc, fs.EXIT_OK, "skip-upload mode exit code 0")
+    ok(not calls3.uploads, "with the switch on, unchanged content is not uploaded")
 
 
 def case_guards(work: Path) -> None:
-    """空快照/行数过少/坏行过多 都必须拦停，且不顶掉上一版文件。"""
+    """An empty snapshot, too few rows, or too many bad rows must all stop the run without clobbering the previous file."""
     calls = Calls()
     patch(make_rows(3), calls)
     cfg = write_cfg(work, min_rows=3)
@@ -257,22 +260,22 @@ def case_guards(work: Path) -> None:
     patch([], calls2)
     try:
         capture(lambda: fs.run(args(cfg)))
-        FAILED.append("空快照应该抛 DataGuardError")
+        FAILED.append("an empty snapshot should raise DataGuardError")
     except fs.DataGuardError:
         PASS_GUARD = True
-        ok(True, "空快照被拦停")
-    eq((work / "feed.jsonl.gz").read_bytes(), good, "拦停后上一版文件没被顶掉")
-    ok(not calls2.uploads, "拦停后没上传")
+        ok(True, "the empty snapshot was stopped")
+    eq((work / "feed.jsonl.gz").read_bytes(), good, "after the stop the previous file was not clobbered")
+    ok(not calls2.uploads, "nothing was uploaded after the stop")
 
     calls3 = Calls()
     patch(make_rows(1), calls3)
     try:
         capture(lambda: fs.run(args(cfg)))
-        FAILED.append("行数低于 min_rows 应该抛 DataGuardError")
+        FAILED.append("a row count below min_rows should raise DataGuardError")
     except fs.DataGuardError:
-        ok(True, "行数暴跌被拦停")
+        ok(True, "the row-count collapse was stopped")
 
-    # 坏行：product.onlineStoreUrl 缺失 → 整行被拒
+    # Bad rows: a missing product.onlineStoreUrl rejects the whole row
     bad = make_rows(4)
     for r in bad[:3]:
         r["product"]["onlineStoreUrl"] = None
@@ -280,25 +283,25 @@ def case_guards(work: Path) -> None:
     patch(bad, calls4)
     try:
         capture(lambda: fs.run(args(write_cfg(work, min_rows=1, max_reject_ratio=0.2))))
-        FAILED.append("坏行比例超阈值应该抛 DataGuardError")
+        FAILED.append("a bad-row ratio over the threshold should raise DataGuardError")
     except fs.DataGuardError:
-        ok(True, "坏行比例超阈值被拦停")
+        ok(True, "the bad-row ratio over the threshold was stopped")
 
 
 def case_shards(work: Path) -> None:
-    """多分片：文件名带序号，remote 名一一对应，指纹覆盖全部分片。"""
+    """Multiple shards: filenames carry an index, remote names correspond one to one, and the fingerprint covers every shard."""
     calls = Calls()
     patch(make_rows(9), calls)
     cfg = write_cfg(work, shard_count=3)
     rc, _ = capture(lambda: fs.run(args(cfg)))
-    eq(rc, fs.EXIT_OK, "分片模式退出码 0")
+    eq(rc, fs.EXIT_OK, "shard mode exit code 0")
     names = sorted(calls.uploads[0][1])
-    # 规范只要求分片集合跨次稳定，没规定命名；这里用固定编号保证稳定
+    # The spec only requires the shard set to stay stable across runs, not a naming scheme; fixed indices keep it stable
     eq(names, ["products-0000.jsonl.gz",
                "products-0001.jsonl.gz",
-               "products-0002.jsonl.gz"], "分片远端名带固定编号")
+               "products-0002.jsonl.gz"], "remote shard names carry a fixed index")
     eq(sorted(calls.uploads[0][0]), ["feed-0000.jsonl.gz", "feed-0001.jsonl.gz",
-                                     "feed-0002.jsonl.gz"], "本地分片名同规则")
+                                     "feed-0002.jsonl.gz"], "local shard names follow the same rule")
     def placement() -> dict[str, str]:
         out: dict[str, str] = {}
         for p in sorted(work.glob("feed-*.jsonl.gz")):
@@ -307,24 +310,24 @@ def case_shards(work: Path) -> None:
         return out
 
     first = placement()
-    eq(len(first), 9, "9 行分布在各分片里，不丢不重")
-    ok(len({v for v in first.values()}) > 1, "行确实散到了多个分片")
+    eq(len(first), 9, "9 rows spread across the shards, none lost or duplicated")
+    ok(len({v for v in first.values()}) > 1, "the rows really did land in more than one shard")
 
-    # 同一 item_id 必须每次落到同一分片：用 sha1 路由，不受 PYTHONHASHSEED 影响
+    # The same item_id must land in the same shard every time: sha1 routing, unaffected by PYTHONHASHSEED
     calls2 = Calls()
-    patch(make_rows(9)[::-1], calls2)   # 打乱顺序也不能改变落点
+    patch(make_rows(9)[::-1], calls2)   # a shuffled order must not change placement
     capture(lambda: fs.run(args(cfg)))
-    eq(placement(), first, "换个抓取顺序重跑，每个 item_id 仍落在同一分片")
+    eq(placement(), first, "rerun with a different fetch order and every item_id still lands in the same shard")
 
 
 def case_cli(work: Path) -> None:
-    """CLI 层：缺 token 退 2，护栏退 3，且都发了告警。"""
+    """CLI layer: a missing token exits 2, a guard exits 3, and both send a notification."""
     cfg = write_cfg(work)
     calls = Calls()
     patch(make_rows(3), calls)
     saved = os.environ.pop("SHOPIFY_ADMIN_TOKEN", None)
     rc, _ = capture(lambda: fs.main(["--config", str(cfg)]))
-    eq(rc, 2, "缺凭证退出码 2")
+    eq(rc, 2, "missing credentials exit code 2")
     if saved:
         os.environ["SHOPIFY_ADMIN_TOKEN"] = saved
 
@@ -332,69 +335,69 @@ def case_cli(work: Path) -> None:
     calls2 = Calls()
     patch([], calls2)
     rc, _ = capture(lambda: fs.main(["--config", str(cfg)]))
-    eq(rc, 3, "数据护栏退出码 3")
-    ok(bool(calls2.notices) and not calls2.notices[-1][1], "护栏拦停时发了失败告警")
+    eq(rc, 3, "data guard exit code 3")
+    ok(bool(calls2.notices) and not calls2.notices[-1][1], "a guard stop sent a failure notification")
 
     calls3 = Calls()
     patch(make_rows(3), calls3)
     rc, _ = capture(lambda: fs.main(["--config", str(cfg), "--limit", "2"]))
-    eq(rc, 0, "--limit 正常退出")
-    ok(calls3.notices and calls3.notices[-1][1], "成功时发了成功报告")
+    eq(rc, 0, "--limit exits normally")
+    ok(calls3.notices and calls3.notices[-1][1], "a success sent a success report")
     txt = json.dumps(calls3.notices, ensure_ascii=False)
-    ok("shop.example.com" not in txt, "报告里域名做了脱敏")
-    ok("shpat_" not in txt, "报告里没有 token")
+    ok("shop.example.com" not in txt, "the domain is redacted in the report")
+    ok("shpat_" not in txt, "there is no token in the report")
 def case_formats(work: Path) -> None:
-    """格式分支：csv.gz 带表头且列齐；缺 pyarrow 时 parquet 必须报清楚。"""
+    """Format branches: csv.gz has a header with all columns; without pyarrow, parquet must say so clearly."""
     calls = Calls()
     patch(make_rows(3), calls)
     cfg = write_cfg(work, output_path=str(work / "feed.csv.gz"), output_format="csv.gz",
                     remote_filename="products.csv.gz")
     rc, _ = capture(lambda: fs.run(args(cfg, dry_run=True)))
-    eq(rc, fs.EXIT_OK, "csv.gz 退出码 0")
+    eq(rc, fs.EXIT_OK, "csv.gz exit code 0")
     with gzip.open(work / "feed.csv.gz", "rt", encoding="utf-8") as fh:
         lines = [ln.rstrip("\n") for ln in fh if ln.strip()]
-    eq(len(lines), 4, "csv 是 1 表头 + 3 行")
+    eq(len(lines), 4, "the csv is 1 header plus 3 rows")
     header = lines[0].split(",")
-    eq(header, list(fs.FEED_COLUMNS), "csv 表头就是规范列顺序")
+    eq(header, list(fs.FEED_COLUMNS), "the csv header is exactly the spec column order")
 
     cfg2 = write_cfg(work, output_path=str(work / "feed.parquet"), output_format="parquet",
                      remote_filename="products.parquet")
     try:
         capture(lambda: fs.run(args(cfg2, dry_run=True)))
-        ok(True, "本机装了 pyarrow，parquet 直接跑通")
+        ok(True, "pyarrow is installed here, so parquet runs straight through")
     except fs.ConfigError as exc:
-        ok("pyarrow" in str(exc), f"缺 pyarrow 时报错点名依赖: {exc}")
+        ok("pyarrow" in str(exc), f"without pyarrow the error names the dependency: {exc}")
     except Exception as exc:  # noqa: BLE001
-        FAILED.append(f"parquet 分支抛了意外异常: {type(exc).__name__}: {exc}")
+        FAILED.append(f"the parquet branch raised an unexpected exception: {type(exc).__name__}: {exc}")
 
 
 def case_sale_and_skips(work: Path) -> None:
-    """打折窗口与跳过规则在真实链路里的表现。"""
+    """How the discount window and the skip rules behave in the real chain."""
     rows = make_rows(4)
     rows[0]["price"] = "19.90"
-    rows[0]["compareAtPrice"] = "29.99"           # 打折
-    rows[1]["compareAtPrice"] = None              # 无原价
-    rows[2]["product"]["status"] = "DRAFT"        # 草稿应跳过
-    rows[3]["price"] = None                       # 无价格应跳过
+    rows[0]["compareAtPrice"] = "29.99"           # on discount
+    rows[1]["compareAtPrice"] = None              # no list price
+    rows[2]["product"]["status"] = "DRAFT"        # a draft should be skipped
+    rows[3]["price"] = None                       # no price should be skipped
     calls = Calls()
     patch(rows, calls)
     cfg = write_cfg(work, min_rows=1, max_reject_ratio=1.0)
     rc, _ = capture(lambda: fs.run(args(cfg, dry_run=True)))
-    eq(rc, fs.EXIT_OK, "混合数据退出码 0")
+    eq(rc, fs.EXIT_OK, "mixed data exit code 0")
     out = read_jsonl_gz(work / "feed.jsonl.gz")
-    eq(len(out), 2, "草稿与无价变体都被跳过")
+    eq(len(out), 2, "both the draft and the priceless variant were skipped")
     by_id = {r["item_id"]: r for r in out}
     disc = by_id[fs.gid_num(rows[0]["id"])]
-    eq(disc["price"], "29.99 USD", "打折时 price 放原价")
-    eq(disc["sale_price"], "19.90 USD", "打折时 sale_price 放现价")
+    eq(disc["price"], "29.99 USD", "on a discount price holds the list price")
+    eq(disc["sale_price"], "19.90 USD", "on a discount sale_price holds the current price")
     plain = by_id[fs.gid_num(rows[1]["id"])]
-    eq(plain.get("sale_price"), None, "没原价就不写 sale_price")
+    eq(plain.get("sale_price"), None, "with no list price sale_price is not written")
     for r in out:
-        eq(fs.validate(r), [], f"产出行自身通过校验: {r['item_id']}")
+        eq(fs.validate(r), [], f"the produced row passes validation on its own: {r['item_id']}")
 
 
 def case_delta_failure(work: Path) -> None:
-    """Delta 被拒时不能报成功；权限没开则算跳过、不算失败。"""
+    """A rejected Delta must not report success; a feature that is not enabled counts as skipped, not failed."""
     calls = Calls()
     patch(make_rows(4), calls)
     cfg = write_cfg(work)
@@ -406,14 +409,14 @@ def case_delta_failure(work: Path) -> None:
     patch(rows2, calls2, delta_result={"ok": False, "sent": 0,
                                        "errors": ["HTTP 400 unknown field"]})
     rc, _ = capture(lambda: fs.run(args(cfg, delta=True)))
-    eq(rc, fs.EXIT_RUNTIME, "Delta 报错时退出码非 0")
+    eq(rc, fs.EXIT_RUNTIME, "a Delta error means a non-zero exit code")
 
     rows3 = make_rows(4)
     rows3[1]["availableForSale"] = False
     calls3 = Calls()
-    patch(rows3, calls3, delta_result={"skipped": "Delta API 未开通", "errors": []})
+    patch(rows3, calls3, delta_result={"skipped": "the Delta API is not enabled", "errors": []})
     rc, _ = capture(lambda: fs.run(args(cfg, delta=True)))
-    eq(rc, fs.EXIT_OK, "权限未开通算跳过，不算失败")
+    eq(rc, fs.EXIT_OK, "a feature that is not enabled counts as skipped, not failed")
 
 
 def main() -> int:
@@ -429,15 +432,15 @@ def main() -> int:
             fn(work)
         except Exception as exc:  # noqa: BLE001
             import traceback
-            FAILED.append(f"{fn.__name__} 抛异常: {type(exc).__name__}: {exc}\n"
+            FAILED.append(f"{fn.__name__} raised: {type(exc).__name__}: {exc}\n"
                           + "".join(traceback.format_tb(exc.__traceback__)[-3:]))
     shutil.rmtree(TMP_ROOT, ignore_errors=True)
     if FAILED:
-        print(f"E2E 失败 {len(FAILED)} 项 / 通过 {PASSED} 项：")
+        print(f"E2E: {len(FAILED)} failed / {PASSED} passed:")
         for f in FAILED:
-            print(f"  ✗ {f}")
+            print(f"  x {f}")
         return 1
-    print(f"E2E 全绿：{PASSED} 项断言通过，{len(cases)} 个场景")
+    print(f"E2E all green: {PASSED} assertions passed across {len(cases)} scenarios")
     return 0
 
 

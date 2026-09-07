@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""不打桩地验证「缺依赖 / 缺凭证」分支的真实行为。不出网、不用真凭证。
+"""Verify the real behaviour of the "missing dependency / missing credentials" branches without stubs. No network, no real credentials.
 
-这些分支平时跑不到：装了 paramiko/pyarrow 的机器上部分断言会自动跳过，
-输出里会说明哪几项没验证。跑法：python3 -B tests/test_guards.py
+These branches are rarely reached: on a machine with paramiko/pyarrow installed some assertions
+skip themselves, and the output says which ones were not verified. Run with: python3 -B tests/test_guards.py
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SRC = Path(os.environ.get("FEED_SRC") or (HERE.parent / "feed_sync.py"))
 if not SRC.exists():
-    sys.exit(f"找不到 feed_sync.py（试过 {SRC}），可用 FEED_SRC 指定")
+    sys.exit(f"feed_sync.py not found (tried {SRC}); set FEED_SRC to point at it")
 spec = importlib.util.spec_from_file_location("feed_sync", SRC)
 assert spec and spec.loader
 fs = importlib.util.module_from_spec(spec)
@@ -35,11 +35,11 @@ def expect(exc_type, needle: str, fn, label: str) -> None:
         if needle in str(e):
             PASSED += 1
         else:
-            FAILED.append(f"{label}: 报错内容里没有 {needle!r}，实际是 {e}")
+            FAILED.append(f"{label}: the error text does not contain {needle!r}, it was {e}")
     except Exception as e:  # noqa: BLE001
-        FAILED.append(f"{label}: 抛了 {type(e).__name__}: {e}")
+        FAILED.append(f"{label}: raised {type(e).__name__}: {e}")
     else:
-        FAILED.append(f"{label}: 没抛异常")
+        FAILED.append(f"{label}: raised nothing")
 
 
 def ok(cond: bool, label: str) -> None:
@@ -58,11 +58,11 @@ for k in list(os.environ):
     if k.startswith("OPENAI_FEED_SFTP"):
         del os.environ[k]
 
-# 1) 缺 host/user
+# 1) missing host/user
 expect(fs.ConfigError, "OPENAI_FEED_SFTP_HOST",
-       lambda: fs.upload_sftp([f], ["products.jsonl.gz"]), "缺 SFTP 主机时报清楚")
+       lambda: fs.upload_sftp([f], ["products.jsonl.gz"]), "a missing SFTP host is reported clearly")
 
-# 2) 有 host/user 但没 paramiko 且没给密钥 → 走 CLI 分支并要求密钥
+# 2) host/user present but no paramiko and no key -> takes the CLI branch and demands a key
 os.environ["OPENAI_FEED_SFTP_HOST"] = "sftp.invalid.test"
 os.environ["OPENAI_FEED_SFTP_USER"] = "nobody"
 try:
@@ -72,58 +72,58 @@ except ImportError:
     HAS_PARAMIKO = False
 
 if HAS_PARAMIKO:
-    ok(True, "本机有 paramiko，跳过 CLI 兜底分支")
+    ok(True, "paramiko is installed here, skipping the CLI fallback branch")
 else:
     expect(fs.ConfigError, "OPENAI_FEED_SFTP_KEY",
            lambda: fs.upload_sftp([f], ["products.jsonl.gz"]),
-           "无 paramiko + 无密钥时要求配密钥")
-    # 3) 给了不存在的私钥路径
+           "no paramiko plus no key demands a key")
+    # 3) a private key path that does not exist
     os.environ["OPENAI_FEED_SFTP_KEY"] = str(work / "nope_ed25519")
-    expect(fs.ConfigError, "私钥不存在",
-           lambda: fs.upload_sftp([f], ["products.jsonl.gz"]), "私钥路径不存在时报清楚")
+    expect(fs.ConfigError, "private key",
+           lambda: fs.upload_sftp([f], ["products.jsonl.gz"]), "a missing private key path is reported clearly")
     del os.environ["OPENAI_FEED_SFTP_KEY"]
 
-# 4) parquet：没装 pyarrow 必须点名依赖，而不是抛 ImportError
+# 4) parquet: without pyarrow the dependency must be named, not raised as an ImportError
 try:
     import pyarrow  # noqa: F401
-    ok(True, "本机有 pyarrow，parquet 直接可用")
+    ok(True, "pyarrow is installed here, parquet works directly")
 except ImportError:
     expect(fs.ConfigError, "pyarrow",
            lambda: fs.FeedWriter(str(work / "x.parquet"), "parquet", 1).open(),
-           "缺 pyarrow 时点名依赖")
+           "a missing pyarrow names the dependency")
 
-# 5) Delta：缺 API key / feed id 时的行为
+# 5) Delta: behaviour with no API key / feed id
 for k in ("OPENAI_ADS_API_KEY", "OPENAI_ADS_FEED_ID"):
     os.environ.pop(k, None)
 cfg = {"delta_include_title": False}
 one = [{"id": "1", "variants": [{"id": "2",
         "availability": {"available": True, "status": "in_stock"}}]}]
-# Delta 是可选功能：没配凭证应当跳过而不是让整轮失败
+# Delta is optional: with no credentials it should skip instead of failing the whole run
 res0 = fs.push_delta(one, cfg)
 ok("skipped" in res0 and "OPENAI_ADS" in res0["skipped"],
-   f"缺 Delta 凭证时跳过并点名变量: {res0}")
-ok("errors" not in res0, "跳过时不产生 errors，不会把整轮判失败")
+   f"missing Delta credentials skip and name the variable: {res0}")
+ok("errors" not in res0, "a skip produces no errors, so the run is not marked failed")
 
-# 6) 空 products 不该发请求
+# 6) empty products must not send a request
 os.environ["OPENAI_ADS_API_KEY"] = "sk-ads-fake"
 os.environ["OPENAI_ADS_FEED_ID"] = "product_feed_fake"
 res = fs.push_delta([], cfg)
-ok("skipped" in res, f"没有变化时 Delta 直接跳过，不发请求: {res}")
+ok("skipped" in res, f"with nothing changed Delta skips outright and sends no request: {res}")
 
-# 7) known_hosts 缺失时的提示要给出 ssh-keyscan
+# 7) a missing known_hosts must point at ssh-keyscan
 if HAS_PARAMIKO:
     os.environ["OPENAI_FEED_SFTP_KNOWN_HOSTS"] = str(work / "empty_known_hosts")
     (work / "empty_known_hosts").write_text("", encoding="utf-8")
-    ok(True, "known_hosts 分支需要 paramiko，本机可跑")
+    ok(True, "the known_hosts branch needs paramiko, which is available here")
 else:
-    ok(True, "known_hosts 校验分支依赖 paramiko，本机未装，未验证")
+    ok(True, "the known_hosts check depends on paramiko, which is not installed here, so it is unverified")
 
 shutil.rmtree(work, ignore_errors=True)
 if FAILED:
-    print(f"守卫分支失败 {len(FAILED)} 项 / 通过 {PASSED} 项：")
+    print(f"guard branches: {len(FAILED)} failed / {PASSED} passed:")
     for x in FAILED:
-        print(f"  ✗ {x}")
+        print(f"  x {x}")
     sys.exit(1)
-print(f"守卫分支全绿：{PASSED} 项")
+print(f"guard branches all green: {PASSED} assertions")
 if not HAS_PARAMIKO:
-    print("  注：本机没装 paramiko，paramiko 上传路径与 host key 校验未验证")
+    print("  note: paramiko is not installed here, so the paramiko upload path and host-key verification are unverified")

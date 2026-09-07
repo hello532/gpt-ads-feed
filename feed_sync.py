@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Shopify → OpenAI 产品 Feed 同步器（全量快照 + 盘中增量）。
+"""Shopify -> OpenAI product feed sync (full snapshot plus intraday delta).
 
-跑法：
-    python3 feed_sync.py --config config.json                  # 全量快照 + SFTP 覆盖 + 通知
-    python3 feed_sync.py --config config.json --dry-run        # 只落盘，不上传
-    python3 feed_sync.py --config config.json --limit 100      # 首次上线用的小样本
-    python3 feed_sync.py --config config.json --bulk           # 大目录走 Bulk Operations
-    python3 feed_sync.py --config config.json --delta          # 只推真实变化的 availability
-    python3 feed_sync.py --self-test                           # 离线自检，不需要凭证
+Usage:
+    python3 feed_sync.py --config config.json                  # full snapshot + SFTP overwrite + notification
+    python3 feed_sync.py --config config.json --dry-run        # write files only, no upload
+    python3 feed_sync.py --config config.json --limit 100      # small sample for the first go-live
+    python3 feed_sync.py --config config.json --bulk           # Bulk Operations for large catalogs
+    python3 feed_sync.py --config config.json --delta          # push only genuinely changed availability
+    python3 feed_sync.py --self-test                           # offline self-test, no credentials needed
 
-交付约束（全部来自官方规范，不是推测）：
-    - Feed 是「全量快照」语义：同一路径同一文件名原地覆盖，至少每天一次。
-    - 首选 parquet(zstd)；jsonl.gz / csv.gz / tsv.gz 同样受支持。
-    - 单 shard ≤ 50 万条，目标 < ~500MB；分片集合必须跨次稳定。
-    - 删除商品 = 下次快照里不出现，或 is_eligible_search=false。
-    - Ads 通道的 feed 连接与 SFTP 凭证只能在 Ads Manager 手工开通；
-      公开 API 只有 PATCH /feeds/{id}/products，且只能改 title 与 availability。
+Delivery constraints (all from the official spec, not guesswork):
+    - The feed has full-snapshot semantics: overwrite the same path and filename in place, at least once a day.
+    - parquet(zstd) is preferred; jsonl.gz / csv.gz / tsv.gz are equally supported.
+    - At most 500,000 rows per shard, target < ~500MB; the shard set must stay stable across runs.
+    - Deleting a product means it is absent from the next snapshot, or is_eligible_search=false.
+    - The Ads-channel feed connection and SFTP credentials can only be provisioned by hand in Ads Manager;
+      the public API offers only PATCH /feeds/{id}/products, and only title and availability can change.
 
-硬规矩：
-    - 凭证只从环境变量读，全程不落盘；日志与通知一律过脱敏。
-    - 金额一律 Decimal + ROUND_HALF_UP，禁止 float（差一分钱就是差一分钱）。
-    - 空快照、拒收率超阈值、上传后字节数不符 —— 都拒绝发布。
+Hard rules:
+    - Credentials are read from the environment only and never written to disk; logs and notifications are always redacted.
+    - Money is always Decimal + ROUND_HALF_UP, never float (a cent off is a cent off).
+    - An empty snapshot, a reject ratio over the threshold, or a byte-count mismatch after upload all refuse to publish.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ EXIT_RUNTIME = 1
 EXIT_CONFIG = 2
 EXIT_DATA_GUARD = 3
 
-# ── 官方规范常量（developers.openai.com/commerce/specs/file-upload/products）──
+# ── Official spec constants (developers.openai.com/commerce/specs/file-upload/products) ──
 REQUIRED_FIELDS: tuple[str, ...] = (
     "is_eligible_search", "is_eligible_checkout", "item_id", "title",
     "description", "url", "brand", "image_url", "price", "availability",
@@ -64,14 +64,14 @@ AVAILABILITY_ENUM = ("in_stock", "out_of_stock", "pre_order", "backorder", "unkn
 AGE_GROUP_ENUM = ("newborn", "infant", "toddler", "kids", "adult")
 CONDITION_ENUM = ("new", "refurbished", "used")
 
-# 规范给出的长度上限，超限会被逐行拒收
+# Length limits from the spec; anything over is rejected row by row
 MAXLEN: dict[str, int] = {
     "item_id": 100, "title": 150, "description": 5000, "brand": 70,
     "mpn": 70, "material": 100, "color": 40, "size": 20,
     "item_group_title": 150, "seller_name": 70, "pricing_trend": 80,
 }
 
-# CSV/TSV 固定表头。流式写盘不能先扫全量再求列并集，所以列集必须预先固定。
+# Fixed CSV/TSV header. Streaming to disk cannot scan everything first to union the columns, so the column set is fixed up front.
 FEED_COLUMNS: tuple[str, ...] = (
     "is_eligible_search", "is_eligible_checkout", "is_ads_eligible",
     "item_id", "gtin", "mpn", "title", "description", "url",
@@ -100,8 +100,8 @@ DISCORD_DESC_MAX = 4096
 DISCORD_FIELD_MAX = 1024
 DISCORD_FIELDS_MAX = 25
 
-# ── 脱敏 ─────────────────────────────────────────────────────────────────
-# 异常消息、URL、GraphQL 报错都可能带 token；所有出口（日志/Discord）过一遍。
+# ── Redaction ────────────────────────────────────────────────────────────
+# Exception messages, URLs and GraphQL errors can all carry a token; every exit (logs/Discord) goes through this.
 SECRET_ENV_KEYS = (
     "SHOPIFY_ADMIN_TOKEN", "OPENAI_ADS_API_KEY", "OPENAI_FEED_SFTP_PASSWORD",
     "DISCORD_WEBHOOK_URL",
@@ -111,12 +111,12 @@ _SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
     re.compile(r"(?i)(bearer|token|api[_-]?key|password)\s*[:=]\s*\S+"),
     re.compile(r"(?i)https://discord(app)?\.com/api/webhooks/\S+"),
-    re.compile(r"://[^/\s:@]+:[^/\s@]+@"),  # URL 内嵌 user:pass
+    re.compile(r"://[^/\s:@]+:[^/\s@]+@"),  # user:pass embedded in a URL
 )
 
 
 def redact(text: Any) -> str:
-    """把任何可能的凭证替换成 ***。出口唯一入口，不要绕过它打印。"""
+    """Replace anything that might be a credential with ***. This is the only exit; do not print around it."""
     out = str(text)
     for key in SECRET_ENV_KEYS:
         val = os.environ.get(key)
@@ -133,22 +133,22 @@ def log(msg: str) -> None:
 
 
 class ConfigError(RuntimeError):
-    """配置或凭证问题 —— 退出码 2，重试没用。"""
+    """A config or credential problem -- exit code 2, retrying will not help."""
 
 
 class DataGuardError(RuntimeError):
-    """数据质量闸门拦下 —— 退出码 3，宁可不发也不发坏快照。"""
+    """The data-quality gate blocked this run -- exit code 3; better to publish nothing than a bad snapshot."""
 
 
 def env(name: str, required: bool = True) -> str:
     val = os.environ.get(name, "").strip()
     if required and not val:
-        raise ConfigError(f"缺少环境变量 {name}")
+        raise ConfigError(f"environment variable {name} is missing")
     return val
 
-# ── 基础工具 ─────────────────────────────────────────────────────────────
+# ── Basic helpers ────────────────────────────────────────────────────────
 def to_decimal(raw: Any) -> Decimal | None:
-    """Shopify 金额是十进制字符串，用 Decimal 接住。float 会丢分，禁用。"""
+    """Shopify money is a decimal string, so hold it in a Decimal. float loses cents and is banned."""
     if raw is None or raw == "":
         return None
     try:
@@ -159,12 +159,12 @@ def to_decimal(raw: Any) -> Decimal | None:
 
 
 def money(amount: Decimal, currency: str) -> str:
-    """规范要求：金额 + 空格 + ISO 4217。ROUND_HALF_UP 对齐店铺前台显示。"""
+    """The spec requires amount + space + ISO 4217. ROUND_HALF_UP matches the storefront display."""
     return f"{amount.quantize(CENT, rounding=ROUND_HALF_UP)} {currency.upper()}"
 
 
 def bool_str(val: bool) -> str:
-    """规范明确写「Lower-case string」，不是 JSON 布尔。"""
+    """The spec explicitly says "Lower-case string", not a JSON boolean."""
     return "true" if val else "false"
 
 
@@ -174,7 +174,7 @@ _BLOCK_RE = re.compile(r"(?i)</(p|div|li|h[1-6]|tr)>|<br\s*/?>")
 
 
 def strip_html(html: str) -> str:
-    """规范要求 description 是 plain text；块级标签换成空格避免单词粘连。"""
+    """The spec requires description to be plain text; block tags become spaces so words do not run together."""
     if not html:
         return ""
     text = _BLOCK_RE.sub(" ", html)
@@ -192,19 +192,19 @@ _GID_RE = re.compile(r"/(\d+)(?:[?#].*)?$")
 
 
 def gid_num(gid: str) -> str:
-    """gid://shopify/ProductVariant/123?ns=x → 123（必须剥掉 query）。"""
+    """gid://shopify/ProductVariant/123?ns=x -> 123 (the query must be stripped)."""
     if not gid:
         return ""
     m = _GID_RE.search(gid)
     if m:
         return m.group(1)
-    # 兜底只接受纯数字（历史 REST id）。返回非数字会让 item_id 变成垃圾，
-    # 而 map_variant 靠空串判断「解析失败」。
+    # The fallback only accepts pure digits (a legacy REST id). Returning a non-number would make
+    # item_id garbage, and map_variant relies on the empty string to mean "could not parse".
     tail = gid.rsplit("/", 1)[-1]
     return tail if tail.isdigit() else ""
 
 def gtin_check_digit_ok(digits: str) -> bool:
-    """GS1 mod-10：从右往左权重 3,1,3,1…（末位是校验位）。"""
+    """GS1 mod-10: weights 3,1,3,1... from the right (the last digit is the check digit)."""
     body, check = digits[:-1], int(digits[-1])
     total = 0
     for i, ch in enumerate(reversed(body)):
@@ -213,7 +213,7 @@ def gtin_check_digit_ok(digits: str) -> bool:
 
 
 def gtin_of(barcode: str | None) -> str:
-    """barcode 是店主手填字段，脏数据重灾区：长度不对或校验位错就当没有。"""
+    """barcode is typed in by the shop owner and is a dirty-data hotspot: a wrong length or check digit counts as absent."""
     if not barcode:
         return ""
     digits = re.sub(r"[\s\-]", "", str(barcode))
@@ -227,32 +227,32 @@ _CRED_URL_RE = re.compile(r"^[a-z][a-z0-9+.\-]*://[^/\s:@]+:[^/\s@]+@")
 
 
 def url_problem(value: str, field: str) -> str | None:
-    """规范：http/https 都合法，但内嵌用户名密码会整行拒收。"""
+    """Spec: http and https are both legal, but embedded credentials reject the whole row."""
     if not value:
         return None
     low = value.strip().lower()
     if not (low.startswith("https://") or low.startswith("http://")):
-        return f"{field} 不是 http(s) URL"
+        return f"{field} is not an http(s) URL"
     if _CRED_URL_RE.match(low):
-        return f"{field} 内嵌了用户名/密码，会被整行拒收"
+        return f"{field} embeds a username/password, which rejects the whole row"
     return None
 
 
-# Shopify WeightUnit 枚举 → 规范要求的单位缩写
+# Shopify WeightUnit enum -> the unit abbreviations the spec requires
 WEIGHT_UNIT_MAP = {
     "GRAMS": "g", "KILOGRAMS": "kg", "OUNCES": "oz", "POUNDS": "lb",
 }
 
 
 def add_variant_url(base: str, variant_id: str) -> str:
-    """onlineStoreUrl 可能已带 query 或 fragment，拼 ?variant= 要看清楚。"""
+    """onlineStoreUrl may already carry a query or fragment, so appending ?variant= needs care."""
     if not variant_id:
         return base
     head, sep, frag = base.partition("#")
     joiner = "&" if "?" in head else "?"
     return f"{head}{joiner}variant={variant_id}{sep}{frag}"
 
-# ── 配置 ─────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────
 FORMAT_SUFFIX = {
     "jsonl.gz": ".jsonl.gz", "csv.gz": ".csv.gz",
     "tsv.gz": ".tsv.gz", "parquet": ".parquet",
@@ -273,7 +273,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "min_price": "0",
     "exclude_tags": [],
     "default_brand": "",
-    # 只在 is_eligible_checkout=true 时必填，但给空默认值，避免别处取键炸掉
+    # Only required when is_eligible_checkout=true, but defaulted to empty so key lookups elsewhere do not blow up
     "seller_privacy_policy": "",
     "seller_tos": "",
     "target_countries": ["US"],
@@ -297,42 +297,43 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "shard_count": 1,
     "delta_include_title": False,
     "currency_override": "",
-    # 默认即使内容一模一样也照传：规范建议「至少每天」投递一次全量快照，
-    # 省掉这次上传就要赌摄取端不看文件时间，不值得。
+    # By default deliver even when the content is byte-identical: the spec recommends a full
+    # snapshot at least once a day, and skipping the upload means betting that the ingest side
+    # ignores file timestamps. Not worth it.
     "skip_upload_when_unchanged": False,
 }
 
 def load_config(path: str) -> dict[str, Any]:
-    """业务配置从 json 读，凭证一律不进这个文件。"""
+    """Business config comes from json; credentials never go in this file."""
     p = Path(path).expanduser()
     if not p.exists():
-        raise ConfigError(f"配置文件不存在: {p}")
+        raise ConfigError(f"config file does not exist: {p}")
     try:
         cfg: dict[str, Any] = json.loads(p.read_text("utf-8"))
     except json.JSONDecodeError as exc:
-        raise ConfigError(f"配置不是合法 JSON: {exc}") from exc
+        raise ConfigError(f"config is not valid JSON: {exc}") from exc
 
     for field in ("shop_domain", "seller_name", "seller_url", "return_policy"):
         if not str(cfg.get(field, "")).strip():
-            raise ConfigError(f"配置缺少必填项 {field}")
+            raise ConfigError(f"config is missing the required field {field}")
     for key, default in CONFIG_DEFAULTS.items():
         cfg.setdefault(key, default)
 
     fmt = cfg["output_format"]
     if fmt not in FORMAT_SUFFIX:
-        raise ConfigError(f"不支持的 output_format: {fmt}（可选 {list(FORMAT_SUFFIX)}）")
-    # 远端文件名后缀必须跟格式一致，否则 OpenAI 侧按后缀选解析器会直接失败
+        raise ConfigError(f"unsupported output_format: {fmt} (choose from {list(FORMAT_SUFFIX)})")
+    # The remote filename suffix must match the format, or the OpenAI side picks a parser by suffix and fails outright
     if not str(cfg["remote_filename"]).endswith(FORMAT_SUFFIX[fmt]):
         raise ConfigError(
-            f"remote_filename 必须以 {FORMAT_SUFFIX[fmt]} 结尾（当前 {cfg['remote_filename']}）"
+            f"remote_filename must end in {FORMAT_SUFFIX[fmt]} (currently {cfg['remote_filename']})"
         )
 
     if not cfg["is_eligible_search"] and cfg["is_eligible_checkout"]:
-        raise ConfigError("规范要求：is_eligible_checkout=true 时 is_eligible_search 必须为 true")
+        raise ConfigError("the spec requires is_eligible_search=true whenever is_eligible_checkout=true")
     if cfg["is_eligible_checkout"]:
         for field in ("seller_privacy_policy", "seller_tos"):
             if not str(cfg.get(field, "")).strip():
-                raise ConfigError(f"开了 checkout 就必须提供 {field}")
+                raise ConfigError(f"{field} is required once checkout is on")
 
     for field in ("seller_url", "return_policy", "seller_privacy_policy", "seller_tos"):
         problem = url_problem(str(cfg.get(field, "")), field)
@@ -340,32 +341,32 @@ def load_config(path: str) -> dict[str, Any]:
             raise ConfigError(problem)
 
     if cfg["oversell_availability"] not in ("in_stock", "backorder", "pre_order"):
-        raise ConfigError("oversell_availability 只能是 in_stock / backorder / pre_order")
+        raise ConfigError("oversell_availability must be in_stock / backorder / pre_order")
     if cfg["condition"] and cfg["condition"] not in CONDITION_ENUM:
-        raise ConfigError(f"condition 只能是 {CONDITION_ENUM}")
+        raise ConfigError(f"condition must be one of {CONDITION_ENUM}")
     if cfg["age_group"] and cfg["age_group"] not in AGE_GROUP_ENUM:
-        raise ConfigError(f"age_group 只能是 {AGE_GROUP_ENUM}")
+        raise ConfigError(f"age_group must be one of {AGE_GROUP_ENUM}")
     return _validate_numeric_config(cfg)
 
 def _validate_numeric_config(cfg: dict[str, Any]) -> dict[str, Any]:
     min_price = to_decimal(cfg["min_price"])
     if min_price is None or min_price < 0:
-        raise ConfigError("min_price 必须是 >= 0 的数字")
+        raise ConfigError("min_price must be a number >= 0")
     cfg["_min_price"] = min_price
 
     size = int(cfg["page_size"])
     if not 1 <= size <= 250:
-        raise ConfigError("page_size 必须在 1..250（Shopify GraphQL 上限）")
+        raise ConfigError("page_size must be within 1..250 (the Shopify GraphQL limit)")
     cfg["page_size"] = size
 
     shards = int(cfg["shard_count"])
     if not 1 <= shards <= 64:
-        raise ConfigError("shard_count 必须在 1..64")
+        raise ConfigError("shard_count must be within 1..64")
     cfg["shard_count"] = shards
 
     ratio = float(cfg["max_reject_ratio"])
     if not 0.0 <= ratio <= 1.0:
-        raise ConfigError("max_reject_ratio 必须在 0..1")
+        raise ConfigError("max_reject_ratio must be within 0..1")
     cfg["max_reject_ratio"] = ratio
 
     countries = cfg["target_countries"]
@@ -373,31 +374,31 @@ def _validate_numeric_config(cfg: dict[str, Any]) -> dict[str, Any]:
         countries = [countries]
     countries = [str(c).strip().upper() for c in countries if str(c).strip()]
     if not countries or not all(_ISO2_RE.match(c) for c in countries):
-        raise ConfigError("target_countries 必须是 ISO 3166-1 alpha-2，例如 [\"US\"]")
+        raise ConfigError("target_countries must be ISO 3166-1 alpha-2, for example [\"US\"]")
     cfg["target_countries"] = countries
 
     store_country = str(cfg["store_country"]).strip().upper()
     if not _ISO2_RE.match(store_country):
-        raise ConfigError("store_country 必须是 ISO 3166-1 alpha-2，例如 \"US\"")
+        raise ConfigError("store_country must be ISO 3166-1 alpha-2, for example \"US\"")
     cfg["store_country"] = store_country
 
     mf = cfg["metafields"]
     if not isinstance(mf, dict):
-        raise ConfigError("metafields 必须是 {feed字段: \"namespace.key\"} 的映射")
+        raise ConfigError("metafields must be a mapping of {feed field: \"namespace.key\"}")
     parsed: dict[str, tuple[str, str]] = {}
     for feed_field, ref in mf.items():
         if feed_field not in FEED_COLUMNS:
-            raise ConfigError(f"metafields 里的 {feed_field} 不是规范字段")
+            raise ConfigError(f"{feed_field} in metafields is not a spec field")
         ns, _, key = str(ref).partition(".")
         if not _MF_KEY_RE.match(ns) or not _MF_KEY_RE.match(key):
-            raise ConfigError(f"metafield 引用格式应为 namespace.key（当前 {ref}）")
+            raise ConfigError(f"a metafield reference must look like namespace.key (currently {ref})")
         parsed[feed_field] = (ns, key)
     cfg["_metafields"] = parsed
     cfg["_exclude_tags"] = {str(t).strip().lower() for t in cfg["exclude_tags"] if str(t).strip()}
     return cfg
 
 # ── GraphQL ──────────────────────────────────────────────────────────────
-# 只要 read_products 就能拿到的字段。这一组不允许降级，缺了就没法建 feed。
+# Fields available with read_products alone. This group may not be degraded; without it there is no feed.
 CORE_VARIANT_FIELDS = """
       id
       title
@@ -420,8 +421,9 @@ CORE_PRODUCT_FIELDS = """
         tags
 """
 
-# 可降级字段组：权限不足或该 API 版本没这个字段时，整条 query 会报错。
-# 逐组摘掉重试，而不是让整个脚本挂掉 —— 这是 v1 最致命的坑。
+# Degradable field groups: with insufficient scopes, or on an API version without the field,
+# the whole query errors out. Drop one group and retry instead of killing the run --
+# this was v1's most damaging bug.
 OPTIONAL_GROUPS: dict[str, tuple[str, str]] = {
     "variant_image": ("variant", "image { url altText }"),
     "variants_count": ("product", "variantsCount { count }"),
@@ -432,7 +434,7 @@ OPTIONAL_GROUPS: dict[str, tuple[str, str]] = {
         "product",
         "media(first: 12, query: \"media_type:IMAGE\") { nodes { preview { image { url } } } }",
     ),
-    # 下面两组需要 read_inventory：只授 read_products 时会 ACCESS_DENIED
+    # The next two need read_inventory: with read_products alone they return ACCESS_DENIED
     "inventory": ("variant", "inventoryQuantity inventoryPolicy"),
     "inventory_item": (
         "variant",
@@ -441,7 +443,7 @@ OPTIONAL_GROUPS: dict[str, tuple[str, str]] = {
 }
 
 def metafield_selection(metafields: dict[str, tuple[str, str]]) -> str:
-    """用别名一次拉多个 metafield（评论数、星级这类 DTC 必备数据在这里）。"""
+    """Pull several metafields at once via aliases (review count, star rating, the DTC essentials)."""
     parts = []
     for idx, (ns, key) in enumerate(metafields.values()):
         parts.append(f'mf{idx}: metafield(namespace: "{ns}", key: "{key}") {{ value }}')
@@ -463,7 +465,7 @@ def build_variants_query(
         if scope == "product" and name in active
     )
     mf = metafield_selection(metafields)
-    # product_status:active 让 Shopify 侧就过滤掉草稿/归档，省掉大量无效额度
+    # product_status:active makes Shopify filter out drafts/archived, saving a lot of wasted quota
     query_arg = ', query: "product_status:active"' if use_status_filter else ""
     return f"""
 query Variants($size: Int!, $cursor: String) {{
@@ -492,7 +494,7 @@ _FIELD_ERR_RE = re.compile(r"[Ff]ield '([A-Za-z_][A-Za-z0-9_]*)'")
 
 
 class Shopify:
-    """Admin GraphQL 客户端。REST products 端点已弃用，一律走 GraphQL。"""
+    """Admin GraphQL client. The REST products endpoint is deprecated, so everything goes through GraphQL."""
 
     def __init__(self, domain: str, token: str, api_version: str) -> None:
         self.endpoint = f"https://{domain}/admin/api/{api_version}/graphql.json"
@@ -506,7 +508,7 @@ class Shopify:
         body = json.dumps({"query": query, "variables": variables or {}}).encode()
         last: Exception | None = None
         for attempt in range(5):
-            # Request 不能跨重试复用：data 已被消费过
+            # A Request cannot be reused across retries: its data has already been consumed
             req = urllib.request.Request(
                 self.endpoint, data=body, method="POST",
                 headers={
@@ -526,17 +528,17 @@ class Shopify:
                 last = exc
             except urllib.error.URLError as exc:
                 if attempt == 4:
-                    raise RuntimeError(f"Shopify 网络错误: {redact(exc)}") from exc
+                    raise RuntimeError(f"Shopify network error: {redact(exc)}") from exc
                 last = exc
             time.sleep(2 ** attempt)
-        else:  # pragma: no cover - 循环必然 break 或 raise
-            raise RuntimeError(f"Shopify 请求失败: {redact(last)}")
+        else:  # pragma: no cover - the loop always breaks or raises
+            raise RuntimeError(f"Shopify request failed: {redact(last)}")
 
         self._absorb_cost(payload.get("extensions"))
         return payload
 
     def _absorb_cost(self, extensions: Any) -> None:
-        """读 throttleStatus 做主动配速，比等 429 再退避高效得多。"""
+        """Read throttleStatus to pace proactively; far better than waiting for a 429 and backing off."""
         try:
             status = extensions["cost"]["throttleStatus"]
             self.available_points = float(status["currentlyAvailable"])
@@ -545,16 +547,16 @@ class Shopify:
             return
 
     def pace(self, next_cost: float = 120.0) -> None:
-        """漏桶余量不够下一页就先睡够恢复时间，别去撞限流。"""
+        """When the leaky bucket cannot cover the next page, sleep off the recovery time instead of hitting the limit."""
         if self.available_points is None or self.available_points >= next_cost:
             return
         need = (next_cost - self.available_points) / self.restore_rate
         wait = min(max(need, 0.2), 10.0)
-        log(f"额度余量 {self.available_points:.0f}，配速等待 {wait:.1f}s")
+        log(f"{self.available_points:.0f} quota points left, pacing for {wait:.1f}s")
         time.sleep(wait)
 
     def query_with_degrade(self, build: Callable[[], str], variables: dict[str, Any]) -> dict[str, Any]:
-        """字段不存在/无权限时，摘掉对应字段组重试，而不是整体失败。"""
+        """When a field is missing or not permitted, drop that field group and retry instead of failing outright."""
         for _ in range(len(OPTIONAL_GROUPS) + 2):
             payload = self.call(build(), variables)
             errors = payload.get("errors")
@@ -567,13 +569,13 @@ class Shopify:
                 continue
             dropped = self._drop_group_for(msgs)
             if dropped:
-                log(f"Shopify 拒了字段组 {dropped}（权限或 API 版本），已摘掉重试")
+                log(f"Shopify rejected field group {dropped} (scopes or API version), dropped it and retrying")
                 continue
-            raise RuntimeError(f"Shopify GraphQL 错误: {redact(msgs)}")
-        raise RuntimeError("Shopify GraphQL 反复失败，已放弃降级重试")
+            raise RuntimeError(f"Shopify GraphQL error: {redact(msgs)}")
+        raise RuntimeError("Shopify GraphQL kept failing, giving up on degrade retries")
 
     def _drop_group_for(self, msgs: str) -> str | None:
-        """按报错里的字段名定位该摘哪一组。"""
+        """Use the field name in the error to work out which group to drop."""
         named = {m.lower() for m in _FIELD_ERR_RE.findall(msgs)}
         for name in list(self.groups):
             _, selection = OPTIONAL_GROUPS[name]
@@ -581,10 +583,10 @@ class Shopify:
             if head in named or head in msgs.lower():
                 self.groups.discard(name)
                 return name
-        # 报错没点名字段：先怀疑 query 过滤器，再按序摘组兜底
+        # The error named no field: suspect the query filter first, then drop groups in order
         if self.use_status_filter and ("query" in msgs.lower() or "argument" in msgs.lower()):
             self.use_status_filter = False
-            return "product_status 过滤器"
+            return "product_status filter"
         if self.groups:
             name = sorted(self.groups)[0]
             self.groups.discard(name)
@@ -594,7 +596,7 @@ class Shopify:
     def shop_info(self) -> dict[str, Any]:
         payload = self.call(SHOP_QUERY)
         if payload.get("errors"):
-            raise RuntimeError(f"读取店铺信息失败: {redact(json.dumps(payload['errors']))}")
+            raise RuntimeError(f"failed to read shop info: {redact(json.dumps(payload['errors']))}")
         return payload["data"]["shop"]
 
     def iter_variants(self, cfg: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -610,13 +612,13 @@ class Shopify:
             page += 1
             yield from block["nodes"]
             if not block["pageInfo"]["hasNextPage"]:
-                log(f"分页拉取完成，共 {page} 页")
+                log(f"paged fetch complete, {page} pages")
                 return
             cursor = block["pageInfo"]["endCursor"]
 
-    # ── Bulk Operations：大目录唯一正解 ──────────────────────────────────
-    # 一次导出整个 productVariants 到 JSONL，不吃分页额度。
-    # 注意 bulk 里连接字段不能带分页参数，所以 media(first:12) 必须摘掉。
+    # ── Bulk Operations: the only real answer for large catalogs ────────
+    # Export all of productVariants to JSONL in one go, without spending pagination quota.
+    # Note that bulk forbids pagination arguments on connections, so media(first:12) must go.
     BULK_START = """
 mutation BulkRun($q: String!) {
   bulkOperationRunQuery(query: $q) {
@@ -661,29 +663,29 @@ mutation BulkRun($q: String!) {
     def iter_variants_bulk(self, cfg: dict[str, Any], poll_seconds: float = 5.0) -> Iterator[dict[str, Any]]:
         payload = self.call(self.BULK_START, {"q": self.build_bulk_query(cfg)})
         if payload.get("errors"):
-            raise RuntimeError(f"启动 bulk 失败: {redact(json.dumps(payload['errors']))}")
+            raise RuntimeError(f"failed to start bulk: {redact(json.dumps(payload['errors']))}")
         result = payload["data"]["bulkOperationRunQuery"]
         if result.get("userErrors"):
             raise RuntimeError(f"bulk userErrors: {redact(json.dumps(result['userErrors']))}")
         op_id = result["bulkOperation"]["id"]
-        log(f"bulk 已启动 {op_id}，轮询中")
+        log(f"bulk started {op_id}, polling")
 
         url = None
-        for _ in range(720):  # 最多等 1 小时
+        for _ in range(720):  # wait at most 1 hour
             time.sleep(poll_seconds)
             data = self.call(self.BULK_POLL)["data"]["currentBulkOperation"]
             status = (data or {}).get("status")
             if status == "COMPLETED":
                 url = data.get("url")
-                log(f"bulk 完成：{data.get('objectCount')} 个对象，{data.get('fileSize')} 字节")
+                log(f"bulk complete: {data.get('objectCount')} objects, {data.get('fileSize')} bytes")
                 break
             if status in ("FAILED", "CANCELED", "EXPIRED"):
-                raise RuntimeError(f"bulk 结束于 {status}，errorCode={data.get('errorCode')}")
+                raise RuntimeError(f"bulk ended in {status}, errorCode={data.get('errorCode')}")
         else:
-            raise RuntimeError("bulk 超过 1 小时未完成，放弃")
+            raise RuntimeError("bulk did not finish within 1 hour, giving up")
 
         if not url:
-            log("bulk 完成但没有结果文件（目录为空）")
+            log("bulk finished with no result file (the catalog is empty)")
             return
         req = urllib.request.Request(url, headers={"Accept": "application/jsonl"})
         with urllib.request.urlopen(req, timeout=300) as resp:
@@ -692,20 +694,21 @@ mutation BulkRun($q: String!) {
                 if not line:
                     continue
                 node = json.loads(line)
-                # 只要 ProductVariant 行；嵌套连接会另起行，这里不需要
+                # Only ProductVariant rows; nested connections come on their own lines and are not needed
                 if "ProductVariant/" in str(node.get("id", "")):
                     yield node
 
-# ── 映射 ─────────────────────────────────────────────────────────────────
+# ── Mapping ──────────────────────────────────────────────────────────────
 class SkipRow(Exception):
-    """这一行不该进 feed，附上原因用于 rejects 报表。"""
+    """This row does not belong in the feed; the reason is attached for the rejects report."""
 
 
 def availability_of(variant: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, str | None]:
-    """返回 (availability, availability_date)。
+    """Returns (availability, availability_date).
 
-    availableForSale 是权威口径：没开库存跟踪时 inventoryQuantity 可能是 0 但仍可售。
-    只有在拿到 inventoryPolicy 时才能识别「超卖中」，也就是真正的 backorder。
+    availableForSale is authoritative: without inventory tracking, inventoryQuantity may be 0
+    while the variant is still sellable. Only inventoryPolicy reveals an active oversell,
+    which is the real backorder.
     """
     if not variant.get("availableForSale"):
         return "out_of_stock", None
@@ -724,7 +727,7 @@ def availability_of(variant: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, 
     if isinstance(days, int) and days > 0:
         when = (datetime.now(timezone.utc).date() + timedelta(days=days)).isoformat()
     if status == "pre_order" and not when:
-        # 规范：pre_order 必须带 availability_date，给不出来就别用这个状态
+        # Spec: pre_order requires availability_date, so do not use that status without one
         return "backorder", None
     return status, when
 
@@ -739,7 +742,7 @@ def _metafield_values(product: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
     return out
 
 def _images_of(variant: dict[str, Any], product: dict[str, Any], cfg: dict[str, Any]) -> tuple[str, list[str]]:
-    """主图优先用变体图，回落到商品主图；附图去重且不含主图。"""
+    """The main image prefers the variant image and falls back to the product's; extras are deduped and exclude the main image."""
     main = ((variant.get("image") or {}).get("url") or "").strip()
     featured = (((product.get("featuredMedia") or {}).get("preview") or {}).get("image") or {})
     featured_url = (featured.get("url") or "").strip()
@@ -762,7 +765,7 @@ def _images_of(variant: dict[str, Any], product: dict[str, Any], cfg: dict[str, 
 
 
 def _title_of(variant: dict[str, Any], product: dict[str, Any]) -> str:
-    """多变体才把变体名拼进标题；单变体拼上去只会污染标题。"""
+    """Only a multi-variant product gets the variant name in the title; on a single variant it just pollutes it."""
     base = (product.get("title") or "").strip()
     vtitle = (variant.get("title") or "").strip()
     count = ((product.get("variantsCount") or {}).get("count"))
@@ -774,7 +777,7 @@ def _title_of(variant: dict[str, Any], product: dict[str, Any]) -> str:
 
 
 def _description_of(product: dict[str, Any], cfg: dict[str, Any], fallback: str) -> str:
-    """SEO 描述通常已是干净的 plain text，比 descriptionHtml 剥标签更可靠。"""
+    """The SEO description is usually already clean plain text, more reliable than stripping descriptionHtml."""
     if cfg["prefer_seo_description"]:
         seo = ((product.get("seo") or {}).get("description") or "").strip()
         if seo:
@@ -783,14 +786,14 @@ def _description_of(product: dict[str, Any], cfg: dict[str, Any], fallback: str)
     return body or fallback
 
 def map_variant(variant: dict[str, Any], cfg: dict[str, Any], currency: str) -> dict[str, Any]:
-    """一个 Shopify 变体 → 一条 feed 记录。不合规就抛 SkipRow。"""
+    """One Shopify variant -> one feed record. Anything non-compliant raises SkipRow."""
     product = variant.get("product") or {}
 
     if (product.get("status") or "").upper() != "ACTIVE":
-        raise SkipRow(f"商品非 ACTIVE（{product.get('status')}）")
+        raise SkipRow(f"product is not ACTIVE ({product.get('status')})")
     online_url = (product.get("onlineStoreUrl") or "").strip()
     if not online_url:
-        raise SkipRow("未发布到在线商店，没有可用 URL")
+        raise SkipRow("not published to the online store, no usable URL")
     problem = url_problem(online_url, "url")
     if problem:
         raise SkipRow(problem)
@@ -798,15 +801,15 @@ def map_variant(variant: dict[str, Any], cfg: dict[str, Any], currency: str) -> 
     tags = {str(t).strip().lower() for t in (product.get("tags") or [])}
     hit = tags & cfg["_exclude_tags"]
     if hit:
-        raise SkipRow(f"命中排除标签 {sorted(hit)}")
+        raise SkipRow(f"matched an excluded tag {sorted(hit)}")
 
     price_amt = to_decimal(variant.get("price"))
     if price_amt is None or price_amt <= 0:
-        raise SkipRow("价格缺失或非正数（规范要求正数）")
+        raise SkipRow("price is missing or not positive (the spec requires a positive number)")
     if price_amt < cfg["_min_price"]:
-        raise SkipRow(f"低于 min_price {cfg['_min_price']}")
+        raise SkipRow(f"below min_price {cfg['_min_price']}")
 
-    # compareAtPrice 才是原价，price 是现价；规范要求 sale_price <= price
+    # compareAtPrice is the list price, price is the current one; the spec requires sale_price <= price
     compare_amt = to_decimal(variant.get("compareAtPrice"))
     list_amt, sale_amt = price_amt, None
     if compare_amt is not None and compare_amt > price_amt:
@@ -814,23 +817,23 @@ def map_variant(variant: dict[str, Any], cfg: dict[str, Any], currency: str) -> 
 
     image_url, extra_images = _images_of(variant, product, cfg)
     if not image_url:
-        raise SkipRow("没有任何图片")
+        raise SkipRow("no image at all")
     problem = url_problem(image_url, "image_url")
     if problem:
         raise SkipRow(problem)
 
     brand = (product.get("vendor") or "").strip() or str(cfg["default_brand"]).strip()
     if not brand:
-        raise SkipRow("brand 为空且未配置 default_brand（规范里 brand 必填）")
+        raise SkipRow("brand is empty and default_brand is not configured (the spec requires brand)")
 
     title = _title_of(variant, product)
     if not title:
-        raise SkipRow("标题为空")
+        raise SkipRow("title is empty")
 
     variant_id = gid_num(variant.get("id") or "")
     product_id = gid_num(product.get("id") or "")
     if not variant_id:
-        raise SkipRow("变体 id 解析失败")
+        raise SkipRow("could not parse the variant id")
     return _assemble_row(
         variant, product, cfg, currency, variant_id, product_id, title,
         brand, image_url, extra_images, list_amt, sale_amt,
@@ -888,6 +891,8 @@ def _assemble_row(
             row["mpn"] = clamp(sku, MAXLEN["mpn"])
     return _decorate_row(row, variant, product, cfg)
 
+# The Chinese keys are Shopify option names as they appear in Chinese-language stores.
+# They are input data, never printed, so they stay as they are.
 _OPTION_ALIASES = {
     "color": "color", "colour": "color", "颜色": "color",
     "size": "size", "尺码": "size", "尺寸": "size",
@@ -899,7 +904,7 @@ def _decorate_row(
     row: dict[str, Any], variant: dict[str, Any],
     product: dict[str, Any], cfg: dict[str, Any],
 ) -> dict[str, Any]:
-    """变体维度 + 重量 + 可选常量 + metafield 覆盖。"""
+    """Variant dimensions + weight + optional constants + metafield overrides."""
     options = {
         str(o.get("name", "")).strip(): str(o.get("value", "")).strip()
         for o in (variant.get("selectedOptions") or [])
@@ -919,8 +924,9 @@ def _decorate_row(
     if row.get("variant_dict") and group_title and group_title != row["title"]:
         row["item_group_title"] = clamp(group_title, MAXLEN["item_group_title"])
 
-    # 以 variantsCount 为准：只有一个变体的商品即使有 Color/Size 选项，
-    # 也不是「多变体列表」。拿不到该字段（组被降级）时才退回看选项。
+    # variantsCount is authoritative: a product with a single variant is not a
+    # "multi-variant listing" even if it has Color/Size options. Only fall back to the
+    # options when that field is unavailable (its group was degraded away).
     count = ((product.get("variantsCount") or {}).get("count"))
     if isinstance(count, int):
         row["listing_has_variations"] = bool_str(count > 1)
@@ -949,7 +955,7 @@ def _decorate_row(
         row[field] = clamp(value, MAXLEN[field]) if field in MAXLEN else value
     return row
 
-# ── 校验 ─────────────────────────────────────────────────────────────────
+# ── Validation ───────────────────────────────────────────────────────────
 _PRICE_RE = re.compile(r"^\d+\.\d{2} [A-Z]{3}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -962,35 +968,35 @@ def _split_money(value: str) -> tuple[Decimal | None, str]:
 
 
 def validate(row: dict[str, Any]) -> list[str]:
-    """本地先把 OpenAI 侧会拒的行拦下来，省一轮 Upload History 排查。"""
+    """Catch rows the OpenAI side would reject before they leave, saving a round of Upload History digging."""
     problems: list[str] = []
     for field in REQUIRED_FIELDS:
         value = row.get(field)
         if value in (None, "", []):
-            problems.append(f"缺少必填字段 {field}")
+            problems.append(f"required field {field} is missing")
 
     if row.get("availability") not in AVAILABILITY_ENUM:
-        problems.append(f"availability 非法: {row.get('availability')}")
+        problems.append(f"availability is illegal: {row.get('availability')}")
     if row.get("availability") == "pre_order" and not row.get("availability_date"):
-        problems.append("availability=pre_order 必须带 availability_date")
+        problems.append("availability=pre_order requires availability_date")
     for field in ("availability_date", "sale_price_start_date", "sale_price_end_date"):
         if row.get(field) and not _DATE_RE.match(str(row[field])):
-            problems.append(f"{field} 不是 ISO 8601 日期")
+            problems.append(f"{field} is not an ISO 8601 date")
 
     price = str(row.get("price", ""))
     if not _PRICE_RE.match(price):
-        problems.append(f"price 必须是「金额 ISO4217」两位小数: {price!r}")
+        problems.append(f"price must be \"amount ISO4217\" with two decimals: {price!r}")
     if row.get("sale_price"):
         sale_amt, sale_cur = _split_money(row["sale_price"])
         list_amt, list_cur = _split_money(price)
         if sale_amt is None or not _PRICE_RE.match(str(row["sale_price"])):
-            problems.append("sale_price 格式非法")
+            problems.append("sale_price format is illegal")
         elif list_amt is not None and sale_amt > list_amt:
-            problems.append("sale_price 必须 <= price")
+            problems.append("sale_price must be <= price")
         elif sale_cur != list_cur:
-            problems.append("sale_price 币种必须与 price 一致")
+            problems.append("sale_price currency must match price")
         elif sale_amt <= 0:
-            problems.append("sale_price 必须为正数")
+            problems.append("sale_price must be positive")
 
     problems.extend(_validate_shape(row))
     return problems
@@ -999,10 +1005,10 @@ def _validate_shape(row: dict[str, Any]) -> list[str]:
     problems: list[str] = []
     if row.get("is_eligible_checkout") == "true":
         if row.get("is_eligible_search") != "true":
-            problems.append("is_eligible_checkout=true 要求 is_eligible_search=true")
+            problems.append("is_eligible_checkout=true requires is_eligible_search=true")
         for field in ("seller_privacy_policy", "seller_tos"):
             if not row.get(field):
-                problems.append(f"checkout 开启但缺少 {field}")
+                problems.append(f"checkout is on but {field} is missing")
 
     for field in ("url", "image_url", "seller_url", "return_policy",
                   "seller_privacy_policy", "seller_tos", "video_url", "model_3d_url"):
@@ -1017,25 +1023,25 @@ def _validate_shape(row: dict[str, Any]) -> list[str]:
     for field, limit in MAXLEN.items():
         value = row.get(field)
         if isinstance(value, str) and len(value) > limit:
-            problems.append(f"{field} 超长 {len(value)}>{limit}")
+            problems.append(f"{field} is too long, {len(value)}>{limit}")
 
     gtin = str(row.get("gtin", ""))
     if gtin and (len(gtin) not in GTIN_VALID_LENGTHS or not gtin.isdigit()
                  or not gtin_check_digit_ok(gtin)):
-        problems.append(f"gtin 校验位或长度不合法: {gtin}")
+        problems.append(f"gtin check digit or length is invalid: {gtin}")
     if row.get("age_group") and row["age_group"] not in AGE_GROUP_ENUM:
-        problems.append(f"age_group 非法: {row['age_group']}")
+        problems.append(f"age_group is illegal: {row['age_group']}")
     if row.get("condition") and row["condition"] not in CONDITION_ENUM:
-        problems.append(f"condition 非法: {row['condition']}")
+        problems.append(f"condition is illegal: {row['condition']}")
 
     unknown = sorted(set(row) - set(FEED_COLUMNS))
     if unknown:
-        problems.append(f"含规范外字段（会被丢弃或整行拒收）: {unknown}")
+        problems.append(f"fields outside the spec (dropped, or the whole row rejected): {unknown}")
     return problems
 
-# ── 落盘 ─────────────────────────────────────────────────────────────────
+# ── Output files ─────────────────────────────────────────────────────────
 def flatten_value(value: Any) -> str:
-    """表格类格式（csv/tsv/parquet）需要标量；list 用逗号，dict 用 JSON。"""
+    """Tabular formats (csv/tsv/parquet) need scalars; a list joins with commas, a dict becomes JSON."""
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -1048,7 +1054,7 @@ def flatten_value(value: Any) -> str:
 
 
 class ShardWriter:
-    """一个分片文件。流式写，不在内存里攒全量。"""
+    """One shard file. Streamed, never buffering all rows in memory."""
 
     def __init__(self, path: Path, fmt: str) -> None:
         self.path = path
@@ -1069,7 +1075,8 @@ class ShardWriter:
             self._open_parquet()
             return
         self._raw = self.tmp.open("wb")
-        # mtime=0 + 固定压缩级别：内容不变则文件字节不变，指纹才能用来判断「今天没变化」
+        # mtime=0 plus a fixed compression level: identical content means identical bytes, which is
+        # what lets the fingerprint answer "nothing changed today"
         self._gz = gzip.GzipFile(filename="", mode="wb", fileobj=self._raw, mtime=0, compresslevel=6)
         self._text = io.TextIOWrapper(self._gz, encoding="utf-8", newline="")
         if self.fmt in ("csv.gz", "tsv.gz"):
@@ -1084,13 +1091,13 @@ class ShardWriter:
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
-        except ImportError as exc:  # 规范首选 parquet，但那是可选依赖
+        except ImportError as exc:  # the spec prefers parquet, but that is an optional dependency
             raise ConfigError(
-                "output_format=parquet 需要 pyarrow：pip install pyarrow；"
-                "或改用 jsonl.gz / csv.gz / tsv.gz"
+                "output_format=parquet needs pyarrow: pip install pyarrow; "
+                "or switch to jsonl.gz / csv.gz / tsv.gz"
             ) from exc
         self._pa, self._pq = pa, pq
-        # 全列 string：feed 里 price 本来就是「79.99 USD」这种带币种的字符串
+        # Every column is a string: in the feed, price is already a string like "79.99 USD"
         self._schema = pa.schema([(c, pa.string()) for c in FEED_COLUMNS])
         self._parquet = pq.ParquetWriter(str(self.tmp), self._schema, compression="zstd")
 
@@ -1116,21 +1123,21 @@ class ShardWriter:
         self._batch.clear()
 
     def close(self) -> Path:
-        """按 text → gzip → raw 的顺序关。v1 没关 raw，句柄一直泄漏。"""
+        """Close in text -> gzip -> raw order. v1 never closed raw and leaked handles."""
         if self.fmt == "parquet":
             self._flush_parquet()
             self._parquet.close()
         else:
             try:
                 self._text.flush()
-                self._text.close()   # 会连带 close gzip
+                self._text.close()   # this closes gzip too
             finally:
-                self._raw.close()    # 底层文件必须显式关
-        os.replace(self.tmp, self.path)  # 同目录 rename，本地也要原子
+                self._raw.close()    # the underlying file must be closed explicitly
+        os.replace(self.tmp, self.path)  # same-directory rename, atomic locally too
         return self.path
 
 def shard_name(base: str, index: int, total: int) -> str:
-    """分片集合必须跨次稳定，所以用固定编号而不是「按需切分」。"""
+    """The shard set must stay stable across runs, so numbering is fixed instead of split on demand."""
     if total <= 1:
         return base
     for suffix in sorted(FORMAT_SUFFIX.values(), key=len, reverse=True):
@@ -1140,7 +1147,7 @@ def shard_name(base: str, index: int, total: int) -> str:
 
 
 class FeedWriter:
-    """按 item_id 哈希把行路由到固定分片，写完统一原子落位。"""
+    """Route rows to a fixed shard by item_id hash, then land them all atomically."""
 
     def __init__(self, out_path: str, fmt: str, shard_count: int) -> None:
         self.base = Path(out_path).expanduser()
@@ -1162,12 +1169,12 @@ class FeedWriter:
         paths = [s.close() for s in self.shards]
         for shard in self.shards:
             if shard.count > MAX_ITEMS_PER_SHARD:
-                log(f"警告：{shard.path.name} 有 {shard.count} 条，超过单分片 50 万条建议值，"
-                    f"请调大 shard_count")
+                log(f"warning: {shard.path.name} holds {shard.count} rows, above the suggested "
+                    f"500,000 per shard; raise shard_count")
         return paths
 
     def abort(self) -> None:
-        """异常路径：清掉 .partial，绝不让半截文件顶掉上一版。"""
+        """Error path: clear .partial, so a half-written file never replaces the previous one."""
         for shard in self.shards:
             for handle in (shard._text, shard._raw):
                 try:
@@ -1185,7 +1192,7 @@ def sha256_of(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 
-# ── 状态与差异 ───────────────────────────────────────────────────────────
+# ── State and diff ───────────────────────────────────────────────────────
 STATE_VERSION = 2
 
 
@@ -1197,10 +1204,10 @@ def load_state(path: str) -> dict[str, Any]:
     try:
         data = json.loads(p.read_text("utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        log(f"状态文件读不了，按首次运行处理: {redact(exc)}")
+        log(f"the state file could not be read, treating this as a first run: {redact(exc)}")
         return empty
     if data.get("version") != STATE_VERSION or not isinstance(data.get("items"), dict):
-        log("状态文件版本不匹配，按首次运行处理")
+        log("state file version mismatch, treating this as a first run")
         return empty
     return data
 
@@ -1220,11 +1227,11 @@ def save_state(path: str, items: dict[str, str], content_sha: str) -> None:
 
 
 def fingerprint(row: dict[str, Any]) -> str:
-    """判断一行「变了没有」只需要会影响买家决策的字段。
+    """Deciding whether a row changed only needs the fields that affect a buyer's decision.
 
-    末位存 group_id：Delta API 要求 products[].id 是父商品 ID，
-    而删除的行只在旧状态里存在，不重新抓一遍就拿不到它的 group_id。
-    分隔符用 \\x1f，商品标题里不会出现。
+    group_id is stored last: the Delta API requires products[].id to be the parent product ID,
+    and a removed row exists only in the old state, so without a refetch its group_id is gone.
+    The separator is \\x1f, which never appears in a product title.
     """
     return "\x1f".join((
         str(row.get("availability", "")),
@@ -1242,7 +1249,7 @@ def _unpack(fp: str) -> tuple[str, str, str, str, str]:
 
 
 def diff_state(old: dict[str, str], new: dict[str, str]) -> dict[str, Any]:
-    """算出「今天真正变了什么」。Delta 只推这一部分，也用来写日报。"""
+    """Work out what actually changed today. Delta pushes only this, and the report uses it too."""
     old_keys, new_keys = set(old), set(new)
     added = sorted(new_keys - old_keys)
     removed = sorted(old_keys - new_keys)
@@ -1271,9 +1278,9 @@ def diff_state(old: dict[str, str], new: dict[str, str]) -> dict[str, Any]:
         "first_run": not old,
     }
 
-# ── 上传 ─────────────────────────────────────────────────────────────────
+# ── Upload ───────────────────────────────────────────────────────────────
 def sftp_settings() -> dict[str, Any]:
-    """凭证只从环境变量取。缺 host 就当没配 SFTP，让调用方决定要不要报错。"""
+    """Credentials come from the environment only. No host means SFTP is unconfigured; the caller decides whether that is an error."""
     return {
         "host": env("OPENAI_FEED_SFTP_HOST", required=False),
         "port": int(env("OPENAI_FEED_SFTP_PORT", required=False) or "22"),
@@ -1291,14 +1298,14 @@ def _remote_join(directory: str, name: str) -> str:
 
 
 def _load_host_keys(client: Any, s: dict[str, Any]) -> None:
-    """明确拒绝未知 host key。AutoAddPolicy 等于关掉中间人防护，不用。"""
+    """Unknown host keys are refused outright. AutoAddPolicy turns off MITM protection, so it is not used."""
     import paramiko
 
     loaded = False
     if s["known_hosts"]:
         path = Path(s["known_hosts"]).expanduser()
         if not path.exists():
-            raise ConfigError(f"OPENAI_FEED_SFTP_KNOWN_HOSTS 指向的文件不存在: {path}")
+            raise ConfigError(f"the file OPENAI_FEED_SFTP_KNOWN_HOSTS points at does not exist: {path}")
         client.load_host_keys(str(path))
         loaded = True
     else:
@@ -1308,14 +1315,14 @@ def _load_host_keys(client: Any, s: dict[str, Any]) -> None:
             loaded = True
     if not loaded:
         raise ConfigError(
-            "找不到 known_hosts。先固定主机指纹再上传：\n"
+            "No known_hosts found. Pin the host fingerprint before uploading:\n"
             f"  ssh-keyscan -p {s['port']} {s['host']} >> ~/.ssh/known_hosts\n"
-            "或用 OPENAI_FEED_SFTP_KNOWN_HOSTS 指定文件路径"
+            "or point OPENAI_FEED_SFTP_KNOWN_HOSTS at a file"
         )
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
 def _upload_one(sftp: Any, local: Path, remote_dir: str, remote_name: str) -> None:
-    """先传 .tmp，核对字节数，再 rename 覆盖。摄取端永远看不到半截文件。"""
+    """Upload to .tmp, check the byte count, then rename over the target. The ingest side never sees a half file."""
     target = _remote_join(remote_dir, remote_name)
     staging = f"{target}.tmp"
     size = local.stat().st_size
@@ -1326,29 +1333,29 @@ def _upload_one(sftp: Any, local: Path, remote_dir: str, remote_name: str) -> No
             sftp.remove(staging)
         except Exception:
             pass
-        raise RuntimeError(f"{remote_name} 上传字节不符：本地 {size}，远端 {uploaded}")
+        raise RuntimeError(f"{remote_name} byte count mismatch on upload: local {size}, remote {uploaded}")
     try:
-        sftp.posix_rename(staging, target)   # 同目录原子覆盖
+        sftp.posix_rename(staging, target)   # atomic overwrite within the same directory
     except (AttributeError, IOError):
         try:
-            sftp.remove(target)              # 老服务器没有 posix_rename 扩展
+            sftp.remove(target)              # older servers have no posix_rename extension
         except IOError:
             pass
         sftp.rename(staging, target)
     final = sftp.stat(target).st_size
     if final != size:
-        raise RuntimeError(f"{remote_name} 落位后字节不符：期望 {size}，远端 {final}")
-    log(f"已上传 {remote_name}（{size} bytes）")
+        raise RuntimeError(f"{remote_name} byte count mismatch after landing: expected {size}, remote {final}")
+    log(f"uploaded {remote_name} ({size} bytes)")
 
 
 def upload_sftp(paths: list[Path], remote_names: list[str]) -> dict[str, Any]:
     s = sftp_settings()
     if not s["host"] or not s["user"]:
-        raise ConfigError("缺少 OPENAI_FEED_SFTP_HOST / OPENAI_FEED_SFTP_USER")
+        raise ConfigError("OPENAI_FEED_SFTP_HOST / OPENAI_FEED_SFTP_USER are missing")
     try:
         import paramiko  # noqa: F401
     except ImportError:
-        log("没装 paramiko，改用系统 sftp 命令")
+        log("paramiko is not installed, falling back to the system sftp command")
         return _upload_sftp_cli(paths, remote_names, s)
     return _upload_sftp_paramiko(paths, remote_names, s)
 
@@ -1368,12 +1375,12 @@ def _upload_sftp_paramiko(paths: list[Path], names: list[str], s: dict[str, Any]
             if s["key"]:
                 key_path = Path(s["key"]).expanduser()
                 if not key_path.exists():
-                    raise ConfigError(f"OPENAI_FEED_SFTP_KEY 指向的私钥不存在: {key_path}")
+                    raise ConfigError(f"the private key OPENAI_FEED_SFTP_KEY points at does not exist: {key_path}")
                 kwargs["key_filename"] = str(key_path)
             elif s["password"]:
                 kwargs["password"] = s["password"]
             else:
-                raise ConfigError("SFTP 既没有 KEY 也没有 PASSWORD")
+                raise ConfigError("SFTP has neither KEY nor PASSWORD")
             client.connect(**kwargs)
             sftp = client.open_sftp()
             try:
@@ -1385,8 +1392,8 @@ def _upload_sftp_paramiko(paths: list[Path], names: list[str], s: dict[str, Any]
         except (ConfigError, paramiko.SSHException) as exc:
             if isinstance(exc, paramiko.BadHostKeyException):
                 raise ConfigError(
-                    f"主机指纹和 known_hosts 不一致（可能是服务器换了密钥，也可能是中间人）。"
-                    f"确认无误后再更新：ssh-keyscan -p {s['port']} {s['host']}"
+                    f"The host fingerprint does not match known_hosts (the server may have rotated its key, "
+                    f"or this may be a man in the middle). Verify first, then update: ssh-keyscan -p {s['port']} {s['host']}"
                 ) from exc
             if isinstance(exc, ConfigError):
                 raise
@@ -1397,25 +1404,25 @@ def _upload_sftp_paramiko(paths: list[Path], names: list[str], s: dict[str, Any]
             client.close()
         if attempt < 3:
             wait = 2 ** attempt
-            log(f"SFTP 第 {attempt} 次失败，{wait}s 后重试: {redact(last)}")
+            log(f"SFTP attempt {attempt} failed, retrying in {wait}s: {redact(last)}")
             time.sleep(wait)
-    raise RuntimeError(f"SFTP 上传失败（3 次）: {redact(last)}")
+    raise RuntimeError(f"SFTP upload failed after 3 attempts: {redact(last)}")
 
 def _upload_sftp_cli(paths: list[Path], names: list[str], s: dict[str, Any]) -> dict[str, Any]:
-    """没有 paramiko 时的兜底。只支持密钥登录，密码留给 paramiko。"""
+    """Fallback when paramiko is absent. Key auth only; passwords are left to paramiko."""
     exe = shutil.which("sftp")
     if not exe:
-        raise ConfigError("既没有 paramiko 也没有 sftp 命令：pip install paramiko")
+        raise ConfigError("neither paramiko nor an sftp command is available: pip install paramiko")
     if not s["key"]:
-        raise ConfigError("sftp 命令模式必须用 OPENAI_FEED_SFTP_KEY（密码模式请装 paramiko）")
+        raise ConfigError("the sftp command mode requires OPENAI_FEED_SFTP_KEY (install paramiko for password auth)")
     key_path = Path(s["key"]).expanduser()
     if not key_path.exists():
-        raise ConfigError(f"OPENAI_FEED_SFTP_KEY 指向的私钥不存在: {key_path}")
+        raise ConfigError(f"the private key OPENAI_FEED_SFTP_KEY points at does not exist: {key_path}")
 
     lines: list[str] = []
     for local, name in zip(paths, names):
         target = _remote_join(s["dir"], name)
-        # 远端路径一律 shlex.quote，防止文件名里的空格或引号被 sftp 解析成额外参数
+        # Always shlex.quote the remote path, so spaces or quotes in a filename are not parsed as extra sftp arguments
         lines.append(f"put {shlex.quote(str(local))} {shlex.quote(target + '.tmp')}")
         lines.append(f"-rm {shlex.quote(target)}")
         lines.append(f"rename {shlex.quote(target + '.tmp')} {shlex.quote(target)}")
@@ -1433,8 +1440,8 @@ def _upload_sftp_cli(paths: list[Path], names: list[str], s: dict[str, Any]) -> 
 
     proc = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=1800)
     if proc.returncode != 0:
-        raise RuntimeError(f"sftp 命令失败（exit {proc.returncode}）: {redact(proc.stderr.strip())}")
-    log(f"已通过 sftp 命令上传 {len(names)} 个文件")
+        raise RuntimeError(f"the sftp command failed (exit {proc.returncode}): {redact(proc.stderr.strip())}")
+    log(f"uploaded {len(names)} files through the sftp command")
     return {"ok": True, "transport": "sftp-cli", "files": names}
 
 # ── HTTP ─────────────────────────────────────────────────────────────────
@@ -1445,7 +1452,7 @@ def post_json(
     method: str = "POST",
     attempts: int = 4,
 ) -> tuple[int, str]:
-    """带退避的 JSON 请求。返回 (状态码, 响应体)，4xx 不重试。"""
+    """JSON request with backoff. Returns (status code, body); 4xx is not retried."""
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     base_headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     base_headers.update(headers or {})
@@ -1462,17 +1469,17 @@ def post_json(
             last = f"HTTP {exc.code}"
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             if attempt == attempts:
-                raise RuntimeError(f"请求 {url.split('?')[0]} 失败: {redact(exc)}") from exc
+                raise RuntimeError(f"request to {url.split('?')[0]} failed: {redact(exc)}") from exc
             last = str(exc)
         wait = min(2 ** attempt, 16)
-        log(f"请求第 {attempt} 次失败（{redact(last)}），{wait}s 后重试")
+        log(f"request attempt {attempt} failed ({redact(last)}), retrying in {wait}s")
         time.sleep(wait)
     return 0, ""
 
 # ── Delta Feeds ──────────────────────────────────────────────────────────
 DELTA_CHUNK = 500
-# 文档只给了 in_stock / out_of_stock 两个显式例子，但 status 是「显式可用性」，
-# 与 flat-file 的 availability 同一套枚举，所以直接透传当前值。
+# The docs only spell out in_stock / out_of_stock, but status is the "explicit availability"
+# and shares the enum with the flat-file availability, so the current value is passed through.
 _DELTA_IN_STOCK = {"in_stock", "pre_order", "backorder"}
 
 
@@ -1481,7 +1488,7 @@ def build_delta_products(
     new_state: dict[str, str],
     include_title: bool,
 ) -> list[dict[str, Any]]:
-    """按父商品聚合变体。同一变体不允许出现两次，所以先按 item_id 去重。"""
+    """Group variants by parent product. A variant may not appear twice, so dedupe by item_id first."""
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item_id in dict.fromkeys(item_ids):
         fp = new_state.get(item_id)
@@ -1489,11 +1496,11 @@ def build_delta_products(
             continue
         availability, _price, _sale, title, group_id = _unpack(fp)
         if not group_id or availability not in AVAILABILITY_ENUM or availability == "unknown":
-            continue  # unknown 推过去没有意义，父 ID 缺失则无法定位
+            continue  # unknown is pointless to push, and without a parent ID there is nothing to target
         variant: dict[str, Any] = {
             "id": item_id,
-            # available 与 status 同时给：文档说两者都在时 status 优先，
-            # 这样即使某侧被忽略语义也一致。
+            # available and status are both supplied: the docs say status wins when both are
+            # present, so the semantics stay the same even if one side is ignored.
             "availability": {
                 "available": availability in _DELTA_IN_STOCK,
                 "status": availability,
@@ -1516,13 +1523,13 @@ def _delta_error_code(text: str) -> str:
 
 
 def push_delta(products: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
-    """只推库存/标题变化。价格变化无法走 delta，必须靠全量快照。"""
+    """Only stock/title changes are pushed. Price changes cannot go through delta, only the full snapshot."""
     feed_id = env("OPENAI_ADS_FEED_ID", required=False)
     api_key = env("OPENAI_ADS_API_KEY", required=False)
     if not feed_id or not api_key:
-        return {"skipped": "缺少 OPENAI_ADS_FEED_ID / OPENAI_ADS_API_KEY"}
+        return {"skipped": "OPENAI_ADS_FEED_ID / OPENAI_ADS_API_KEY are missing"}
     if not products:
-        return {"skipped": "没有可推送的库存或标题变化"}
+        return {"skipped": "no stock or title changes to push"}
 
     url = f"{ADS_API_BASE}/feeds/{urllib.parse.quote(feed_id, safe='')}/products"
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -1542,8 +1549,8 @@ def push_delta(products: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str,
             try:
                 accepted = bool(json.loads(text).get("accepted"))
             except json.JSONDecodeError:
-                errors.append("200 但响应不是合法 JSON")
-            # accepted=false 表示 feed 处理侧没收下，不能当成功
+                errors.append("HTTP 200 but the response is not valid JSON")
+            # accepted=false means the feed side did not take it, so this is not a success
             if accepted:
                 accepted_chunks += 1
                 sent_variants += n_variants
@@ -1553,8 +1560,8 @@ def push_delta(products: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str,
 
         code = _delta_error_code(text)
         if status == 403 and code in ("product_feed_api_disabled", "product_feed_delta_api_disabled"):
-            # 明确文档化：未开通就不要反复重试
-            return {"skipped": f"账户未开通 Delta Feeds API（{code}），找 OpenAI 客户团队开权限"}
+            # Explicitly documented: do not keep retrying when it is not enabled
+            return {"skipped": f"the account does not have the Delta Feeds API enabled ({code}), ask your OpenAI account team"}
         errors.append(f"HTTP {status} {code or ''}: {clamp(redact(text), 200)}".strip())
         break
 
@@ -1565,9 +1572,9 @@ def push_delta(products: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str,
         "errors": errors,
     }
 
-# ── 通知 ─────────────────────────────────────────────────────────────────
+# ── Notifications ────────────────────────────────────────────────────────
 def mask_domain(domain: str) -> str:
-    """日报里店铺名脱敏，只留首尾各 2 个字符。"""
+    """Mask the shop name in the report, keeping only 2 characters at each end."""
     head, _, tail = domain.partition(".")
     if len(head) <= 4:
         return f"{head[:1]}***.{tail}" if tail else f"{head[:1]}***"
@@ -1591,11 +1598,11 @@ def notify_discord(title: str, fields: list[tuple[str, str]], ok: bool, note: st
         embed["description"] = clamp(redact(note), DISCORD_DESC_MAX)
     status, text = post_json(webhook, {"embeds": [embed]}, attempts=3)
     if status not in (200, 204):
-        log(f"Discord 通知失败 HTTP {status}: {clamp(redact(text), 200)}")
+        log(f"Discord notification failed, HTTP {status}: {clamp(redact(text), 200)}")
 
 
 def write_rejects(path: str, rejects: list[tuple[str, str, str]]) -> Path | None:
-    """被拒的行单独落一个 CSV，方便回店里改数据。"""
+    """Rejected rows go into their own CSV, so the data can be fixed back in the store."""
     if not rejects:
         return None
     p = Path(path).expanduser()
@@ -1609,7 +1616,7 @@ def write_rejects(path: str, rejects: list[tuple[str, str, str]]) -> Path | None
     os.replace(tmp, p)
     return p
 
-# ── 采集 ─────────────────────────────────────────────────────────────────
+# ── Collection ───────────────────────────────────────────────────────────
 REJECT_SAMPLE_MAX = 200
 
 
@@ -1620,7 +1627,7 @@ def collect(
     writer: FeedWriter | None,
     limit: int = 0,
 ) -> dict[str, Any]:
-    """边抓边写。内存里只留指纹和计数，不攒全量行。"""
+    """Write while fetching. Only fingerprints and counters stay in memory, never all rows."""
     state: dict[str, str] = {}
     reasons: dict[str, int] = {}
     samples: list[tuple[str, str, str]] = []
@@ -1649,7 +1656,7 @@ def collect(
         item_id = row["item_id"]
         if item_id in state:
             dupes += 1
-            note(item_id, row["title"], "item_id 重复，已丢弃后一条")
+            note(item_id, row["title"], "duplicate item_id, the later row was dropped")
             continue
 
         if writer is not None:
@@ -1658,7 +1665,7 @@ def collect(
         seen_products.add(row.get("group_id") or item_id)
         written += 1
         if limit and written >= limit:
-            log(f"已达 --limit {limit}，停止抓取")
+            log(f"reached --limit {limit}, stopping the fetch")
             break
 
     return {
@@ -1667,32 +1674,33 @@ def collect(
         "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])), "samples": samples,
     }
 
-# ── 主流程 ───────────────────────────────────────────────────────────────
+# ── Main flow ────────────────────────────────────────────────────────────
 def _guard_snapshot(res: dict[str, Any], cfg: dict[str, Any]) -> None:
-    """全量快照语义下，一次写错就等于全店下架。这里是最后一道闸。"""
+    """With full-snapshot semantics one bad write delists the whole store. This is the last gate."""
     written = res["written"]
     if written == 0:
         raise DataGuardError(
-            "快照为空。全量投递里空文件等于「本店无商品」，会下架整个目录，已拒绝发布。"
-            f" 跳过 {res['skipped']} 条，校验失败 {res['invalid']} 条"
+            "The snapshot is empty. In a full delivery an empty file means \"this store has no products\""
+            " and would delist the entire catalog, so publishing was refused."
+            f" Skipped {res['skipped']} rows, {res['invalid']} failed validation"
         )
     if written < int(cfg["min_rows"]):
         raise DataGuardError(
-            f"只产出 {written} 条，低于 min_rows={cfg['min_rows']}，已拒绝发布"
+            f"Only {written} rows were produced, below min_rows={cfg['min_rows']}, publishing refused"
         )
     total = written + res["skipped"] + res["invalid"] + res["dupes"]
     ratio = (total - written) / total if total else 0.0
     if ratio > cfg["max_reject_ratio"]:
         top = list(res["reasons"].items())[:3]
         raise DataGuardError(
-            f"拒收率 {ratio:.1%} 超过 max_reject_ratio={cfg['max_reject_ratio']:.0%}，"
-            f"已拒绝发布。主要原因: {top}"
+            f"Reject ratio {ratio:.1%} exceeds max_reject_ratio={cfg['max_reject_ratio']:.0%}, "
+            f"publishing refused. Main reasons: {top}"
         )
 
 
 def _fetch_variants(client: Shopify, cfg: dict[str, Any], use_bulk: bool) -> Iterable[dict[str, Any]]:
     if use_bulk:
-        log("使用 Bulk Operations 抓取")
+        log("fetching with Bulk Operations")
         return client.iter_variants_bulk(cfg)
     return client.iter_variants(cfg)
 
@@ -1705,13 +1713,13 @@ def run(args: argparse.Namespace) -> int:
 
     currency = str(cfg["currency_override"]).strip().upper()
     if currency:
-        log(f"币种用配置里的 {currency}")
+        log(f"using the currency from the config: {currency}")
     else:
         shop = client.shop_info()
         currency = shop["currency"]
-        log(f"店铺 {mask_domain(shop['domain'])}，币种 {currency}")
+        log(f"shop {mask_domain(shop['domain'])}, currency {currency}")
     if not _ISO2_RE.match(currency[:2]) or len(currency) != 3:
-        raise ConfigError(f"币种不是合法 ISO 4217: {currency}")
+        raise ConfigError(f"currency is not a valid ISO 4217 code: {currency}")
 
     prev = load_state(str(cfg["state_path"]))
     writer = FeedWriter(str(cfg["output_path"]), str(cfg["output_format"]), int(cfg["shard_count"]))
@@ -1720,7 +1728,7 @@ def run(args: argparse.Namespace) -> int:
         _guard_snapshot(res, cfg)
         paths = writer.close()
     except BaseException:
-        writer.abort()   # 半截文件绝不允许顶掉上一版
+        writer.abort()   # a half-written file must never replace the previous one
         raise
 
     sizes = {p.name: p.stat().st_size for p in paths}
@@ -1728,8 +1736,8 @@ def run(args: argparse.Namespace) -> int:
         "".join(sha256_of(p) for p in sorted(paths)).encode()
     ).hexdigest()
     unchanged = bool(prev.get("content_sha256")) and prev["content_sha256"] == content_sha
-    log(f"产出 {res['written']} 条 / {res['products']} 个商品，"
-        f"{sum(sizes.values())} 字节，sha256={content_sha[:12]}")
+    log(f"produced {res['written']} rows / {res['products']} products, "
+        f"{sum(sizes.values())} bytes, sha256={content_sha[:12]}")
 
     diff = diff_state(prev.get("items") or {}, res["state"])
     rejects_file = write_rejects(str(cfg["rejects_path"]), res["samples"])
@@ -1746,21 +1754,22 @@ def _publish(
     remote_names = [shard_name(remote_base, i, shard_count) for i in range(shard_count)]
 
     upload: dict[str, Any] = {"skipped": "--dry-run"}
-    delta: dict[str, Any] = {"skipped": "未开启 --delta"}
+    delta: dict[str, Any] = {"skipped": "--delta not enabled"}
     if args.dry_run:
-        log("dry-run：本地文件已生成，不上传、不写状态")
+        log("dry-run: local files written, no upload and no state")
     elif unchanged and cfg["skip_upload_when_unchanged"]:
-        upload = {"skipped": "内容与上次完全一致"}
-        log("内容未变化，按配置跳过上传")
+        upload = {"skipped": "content is byte-identical to last time"}
+        log("content unchanged, skipping the upload as configured")
     else:
         if unchanged:
-            log("内容与上次一致，仍按「至少每天一次」照常投递")
+            log('content is identical to last time, still delivering to honour "at least once a day"')
         upload = upload_sftp(paths, remote_names)
 
-    # Delta 只能改已存在变体的库存/标题：首次运行没有基线，新增和删除也推不了
+    # Delta can only change stock/title on variants that already exist: a first run has no
+    # baseline, and additions and removals cannot be pushed either
     if args.delta and not args.dry_run:
         if diff["first_run"]:
-            delta = {"skipped": "首次运行，没有基线可比"}
+            delta = {"skipped": "first run, no baseline to compare against"}
         else:
             targets = sorted(set(diff["stock_changed"]) | (
                 set(diff["title_changed"]) if cfg["delta_include_title"] else set()
@@ -1768,21 +1777,21 @@ def _publish(
             products = build_delta_products(targets, res["state"], bool(cfg["delta_include_title"]))
             delta = push_delta(products, cfg)
             if diff["price_changed"]:
-                log(f"{len(diff['price_changed'])} 条改了价格，Delta API 不支持价格，"
-                    f"这部分靠上面的全量快照生效")
+                log(f"{len(diff['price_changed'])} rows changed price; the Delta API does not support price, "
+                    f"so those take effect through the full snapshot above")
 
     ok = ("skipped" in upload or upload.get("ok")) and not delta.get("errors")
     if not args.dry_run and not args.limit and (upload.get("ok") or upload.get("skipped")):
         save_state(str(cfg["state_path"]), res["state"], content_sha)
     elif args.limit:
-        log("--limit 模式不写状态，避免把子集当成完整基线")
+        log("--limit mode does not write state, so a subset is never mistaken for a full baseline")
 
     _report(cfg, res, diff, sizes, content_sha, upload, delta, rejects_file, ok, started)
     return EXIT_OK if ok else EXIT_RUNTIME
 
 def _status_text(result: dict[str, Any]) -> str:
     if "skipped" in result:
-        return f"skipped（{result['skipped']}）"
+        return f"skipped ({result['skipped']})"
     if result.get("errors"):
         return f"failed: {'; '.join(result['errors'][:2])}"
     return "success"
@@ -1795,41 +1804,41 @@ def _report(
 ) -> None:
     total_in = res["written"] + res["skipped"] + res["invalid"] + res["dupes"]
     fields: list[tuple[str, str]] = [
-        ("店铺", mask_domain(str(cfg["shop_domain"]))),
-        ("Shopify 商品", str(res["products"])),
-        ("Feed 记录", f"{res['written']}/{total_in}"),
-        ("跳过/错误", f"{res['skipped']}/{res['invalid'] + res['dupes']}"),
-        ("文件大小", f"{sum(sizes.values())} bytes" + (f" × {len(sizes)} 分片" if len(sizes) > 1 else "")),
-        ("内容指纹", content_sha[:12]),
-        ("OpenAI 状态", _status_text(upload)),
-        ("Delta 状态", _status_text(delta) if "skipped" not in delta
-            else f"skipped（{delta['skipped']}）"),
-        ("耗时", f"{time.time() - started:.1f}s"),
+        ("Shop", mask_domain(str(cfg["shop_domain"]))),
+        ("Shopify products", str(res["products"])),
+        ("Feed records", f"{res['written']}/{total_in}"),
+        ("Skipped/errors", f"{res['skipped']}/{res['invalid'] + res['dupes']}"),
+        ("File size", f"{sum(sizes.values())} bytes" + (f" x {len(sizes)} shards" if len(sizes) > 1 else "")),
+        ("Content fingerprint", content_sha[:12]),
+        ("OpenAI status", _status_text(upload)),
+        ("Delta status", _status_text(delta) if "skipped" not in delta
+            else f"skipped ({delta['skipped']})"),
+        ("Duration", f"{time.time() - started:.1f}s"),
     ]
     if not diff["first_run"]:
         fields.append((
-            "变化",
-            f"新增 {len(diff['added'])} / 下架 {len(diff['removed'])} / "
-            f"价格 {len(diff['price_changed'])} / 库存 {len(diff['stock_changed'])}",
+            "Changes",
+            f"added {len(diff['added'])} / removed {len(diff['removed'])} / "
+            f"price {len(diff['price_changed'])} / stock {len(diff['stock_changed'])}",
         ))
     if delta.get("variants"):
-        fields.append(("Delta 推送", f"{delta['variants']} 个变体 / {delta['chunks']} 批"))
+        fields.append(("Delta push", f"{delta['variants']} variants / {delta['chunks']} batches"))
 
     note = ""
     if res["reasons"]:
         top = list(res["reasons"].items())[:5]
-        note = "拒收原因 Top:\n" + "\n".join(f"· {r} × {n}" for r, n in top)
+        note = "Top reject reasons:\n" + "\n".join(f"- {r} x {n}" for r, n in top)
         if rejects_file:
-            note += f"\n明细: {rejects_file}"
+            note += f"\nDetails: {rejects_file}"
 
     for name, value in fields:
         log(f"  {name}: {value}")
     notify_discord(
-        "GPT Ads Feed 每日更新成功" if ok else "GPT Ads Feed 更新失败",
+        "GPT Ads Feed daily update succeeded" if ok else "GPT Ads Feed update failed",
         fields, ok, note,
     )
 
-# ── 自检 ─────────────────────────────────────────────────────────────────
+# ── Self-test ────────────────────────────────────────────────────────────
 SELF_TEST_CFG_RAW: dict[str, Any] = {
     "shop_domain": "example.myshopify.com",
     "seller_name": "Example Store",
@@ -1842,7 +1851,7 @@ SELF_TEST_CFG_RAW: dict[str, Any] = {
 
 
 def _cfg(**over: Any) -> dict[str, Any]:
-    """自检用配置。走真正的 load_config，顺便覆盖校验逻辑。"""
+    """Self-test config. Goes through the real load_config, covering validation too."""
     raw = dict(SELF_TEST_CFG_RAW)
     raw.update(over)
     tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"feedcfg_{os.getpid()}.json"
@@ -1903,221 +1912,222 @@ class _Check:
             self.passed += 1
             return
         except Exception as other:  # noqa: BLE001
-            self.failed.append(f"{label}: 抛了 {type(other).__name__} 而不是 {exc.__name__}")
+            self.failed.append(f"{label}: raised {type(other).__name__} instead of {exc.__name__}")
             return
-        self.failed.append(f"{label}: 应该抛 {exc.__name__} 但没抛")
+        self.failed.append(f"{label}: expected {exc.__name__}, nothing was raised")
 
 
 def _t_money(c: _Check) -> None:
-    c.eq(money(Decimal("19.9"), "usd"), "19.90 USD", "money 补两位并大写币种")
-    c.eq(money(Decimal("0.005"), "USD"), "0.01 USD", "money 用 ROUND_HALF_UP 而不是银行家舍入")
-    c.eq(money(Decimal("2.675"), "USD"), "2.68 USD", "money 0.675 进位")
-    c.eq(to_decimal("abc"), None, "to_decimal 拒绝非数字")
-    c.eq(to_decimal(None), None, "to_decimal 拒绝 None")
-    c.eq(to_decimal("NaN"), None, "to_decimal 拒绝 NaN")
-    c.eq(to_decimal("Infinity"), None, "to_decimal 拒绝 Infinity")
-    c.eq(to_decimal("19.90"), Decimal("19.90"), "to_decimal 正常解析")
-    c.eq(str(to_decimal(0.1)), "0.1", "to_decimal 先转 str 再进 Decimal，避免浮点尾巴")
+    c.eq(money(Decimal("19.9"), "usd"), "19.90 USD", "money pads to two decimals and upper-cases the currency")
+    c.eq(money(Decimal("0.005"), "USD"), "0.01 USD", "money uses ROUND_HALF_UP, not banker's rounding")
+    c.eq(money(Decimal("2.675"), "USD"), "2.68 USD", "money rounds 2.675 up")
+    c.eq(to_decimal("abc"), None, "to_decimal rejects non-numbers")
+    c.eq(to_decimal(None), None, "to_decimal rejects None")
+    c.eq(to_decimal("NaN"), None, "to_decimal rejects NaN")
+    c.eq(to_decimal("Infinity"), None, "to_decimal rejects Infinity")
+    c.eq(to_decimal("19.90"), Decimal("19.90"), "to_decimal parses a normal amount")
+    c.eq(str(to_decimal(0.1)), "0.1", "to_decimal goes through str first, avoiding float tails")
 
 
 def _t_strings(c: _Check) -> None:
-    c.eq(strip_html("<p>a</p><p>b</p>"), "a b", "strip_html 段落间补空格")
-    c.eq(strip_html("a &amp; b"), "a & b", "strip_html 解实体")
-    c.eq(strip_html("<br>x"), "x", "strip_html 处理 br")
-    c.eq(clamp("abcdef", 4), "abc…", "clamp 截断并留省略号")
-    c.ok(len(clamp("x" * 300, 150)) == 150, "clamp 后长度不超限")
-    c.eq(clamp("ab", 4), "ab", "clamp 不动短串")
-    c.eq(gid_num("gid://shopify/ProductVariant/42"), "42", "gid_num 取尾号")
-    c.eq(gid_num("gid://shopify/ProductVariant/42?x=1"), "42", "gid_num 忽略 query")
-    c.eq(gid_num("nonsense"), "", "gid_num 无数字返回空")
-    c.eq(gid_num("456"), "456", "gid_num 接受裸数字 ID")
-    c.eq(gid_num(""), "", "gid_num 容忍空串")
+    c.eq(strip_html("<p>a</p><p>b</p>"), "a b", "strip_html puts a space between paragraphs")
+    c.eq(strip_html("a &amp; b"), "a & b", "strip_html unescapes entities")
+    c.eq(strip_html("<br>x"), "x", "strip_html handles br")
+    c.eq(clamp("abcdef", 4), "abc…", "clamp truncates and keeps an ellipsis")
+    c.ok(len(clamp("x" * 300, 150)) == 150, "clamp output stays within the limit")
+    c.eq(clamp("ab", 4), "ab", "clamp leaves short strings alone")
+    c.eq(gid_num("gid://shopify/ProductVariant/42"), "42", "gid_num takes the trailing number")
+    c.eq(gid_num("gid://shopify/ProductVariant/42?x=1"), "42", "gid_num ignores the query string")
+    c.eq(gid_num("nonsense"), "", "gid_num returns empty when there is no number")
+    c.eq(gid_num("456"), "456", "gid_num accepts a bare numeric ID")
+    c.eq(gid_num(""), "", "gid_num tolerates an empty string")
 
 def _t_gtin_url(c: _Check) -> None:
-    c.ok(gtin_check_digit_ok("0012345678905"), "GTIN-13 合法校验位")
-    c.ok(not gtin_check_digit_ok("0012345678904"), "GTIN 错校验位被拒")
-    c.eq(gtin_of("0012345678905"), "0012345678905", "gtin_of 通过")
-    c.eq(gtin_of("00-1234 5678905"), "0012345678905", "gtin_of 去空格连字符")
-    c.eq(gtin_of("12345"), "", "gtin_of 拒绝非法长度")
-    c.eq(gtin_of("abcdefgh"), "", "gtin_of 拒绝非数字")
-    c.eq(gtin_of(None), "", "gtin_of 容忍 None")
-    c.eq(url_problem("https://a.com/x", "url"), None, "https 通过")
-    c.ok(url_problem("ftp://a.com", "url") is not None, "非 http(s) 被拒")
-    c.ok(url_problem("https://u:p@a.com/x", "url") is not None, "带账密的 URL 被拒")
-    # 空串交给必填校验处理：选填 URL（如未开 checkout 时的隐私政策）本来就允许空
-    c.eq(url_problem("", "url"), None, "空 URL 不在这里判，留给必填校验")
-    c.eq(url_problem("http://a.com/x", "url"), None, "http 也合法")
-    c.eq(add_variant_url("https://a.com/p/t", "9"), "https://a.com/p/t?variant=9", "变体参数用 ?")
+    c.ok(gtin_check_digit_ok("0012345678905"), "GTIN-13 with a valid check digit")
+    c.ok(not gtin_check_digit_ok("0012345678904"), "GTIN with a wrong check digit is rejected")
+    c.eq(gtin_of("0012345678905"), "0012345678905", "gtin_of accepts a valid barcode")
+    c.eq(gtin_of("00-1234 5678905"), "0012345678905", "gtin_of strips spaces and hyphens")
+    c.eq(gtin_of("12345"), "", "gtin_of rejects an invalid length")
+    c.eq(gtin_of("abcdefgh"), "", "gtin_of rejects non-digits")
+    c.eq(gtin_of(None), "", "gtin_of tolerates None")
+    c.eq(url_problem("https://a.com/x", "url"), None, "https passes")
+    c.ok(url_problem("ftp://a.com", "url") is not None, "a non-http(s) URL is rejected")
+    c.ok(url_problem("https://u:p@a.com/x", "url") is not None, "a URL with credentials is rejected")
+    # An empty string is left to the required-field check: optional URLs (the privacy
+    # policy while checkout is off, say) are allowed to be empty.
+    c.eq(url_problem("", "url"), None, "an empty URL is not judged here, the required-field check owns it")
+    c.eq(url_problem("http://a.com/x", "url"), None, "http is legal too")
+    c.eq(add_variant_url("https://a.com/p/t", "9"), "https://a.com/p/t?variant=9", "the variant param uses ?")
     c.eq(add_variant_url("https://a.com/p/t?x=1", "9"), "https://a.com/p/t?x=1&variant=9",
-         "已有 query 时用 &")
+         "an existing query means &")
     c.eq(add_variant_url("https://a.com/p/t#frag", "9"), "https://a.com/p/t?variant=9#frag",
-         "锚点保留在最后")
+         "the fragment stays at the end")
 
 
 def _t_redaction(c: _Check) -> None:
     c.ok("shpat_" not in redact("token=shpat_0123456789abcdef0123456789abcdef"),
-         "shpat_ 令牌被脱敏")
-    c.ok("sk-" not in redact("key sk-proj-abcdefghijklmnopqrstuvwxyz1234"), "sk- 密钥被脱敏")
-    c.ok("hunter2" not in redact("password: hunter2sekrit"), "password 赋值被脱敏")
-    c.ok("hunter2" not in redact("https://u:hunter2@host/p"), "URL 内嵌账密被脱敏")
+         "an shpat_ token is redacted")
+    c.ok("sk-" not in redact("key sk-proj-abcdefghijklmnopqrstuvwxyz1234"), "an sk- key is redacted")
+    c.ok("hunter2" not in redact("password: hunter2sekrit"), "a password assignment is redacted")
+    c.ok("hunter2" not in redact("https://u:hunter2@host/p"), "credentials inside a URL are redacted")
     c.ok("123456" not in redact("https://discord.com/api/webhooks/123456/abcdefg"),
-         "Discord webhook 被脱敏")
-    c.eq(redact("正常日志"), "正常日志", "普通文本不动")
-    c.eq(mask_domain("verylongshop.myshopify.com"), "ve***op.myshopify.com", "店铺名脱敏")
-    c.eq(mask_domain("abc.myshopify.com"), "a***.myshopify.com", "短店铺名脱敏")
+         "a Discord webhook is redacted")
+    c.eq(redact("ordinary log line"), "ordinary log line", "plain text is left alone")
+    c.eq(mask_domain("verylongshop.myshopify.com"), "ve***op.myshopify.com", "the shop domain is masked")
+    c.eq(mask_domain("abc.myshopify.com"), "a***.myshopify.com", "a short shop domain is masked")
 
 def _t_availability(c: _Check) -> None:
     cfg = _cfg()
-    c.eq(availability_of(_variant(), cfg)[0], "in_stock", "可售即 in_stock")
+    c.eq(availability_of(_variant(), cfg)[0], "in_stock", "sellable means in_stock")
     c.eq(availability_of(_variant(availableForSale=False), cfg)[0], "out_of_stock",
-         "availableForSale=false 即 out_of_stock")
-    # 允许超卖 + 库存 <= 0 才是真的 backorder
+         "availableForSale=false means out_of_stock")
+    # Overselling allowed plus inventory <= 0 is the only real backorder
     oversold = _variant(availableForSale=True, inventoryPolicy="CONTINUE", inventoryQuantity=0)
-    c.eq(availability_of(oversold, cfg)[0], "backorder", "超卖中默认 backorder")
+    c.eq(availability_of(oversold, cfg)[0], "backorder", "an active oversell defaults to backorder")
     stocked = _variant(availableForSale=True, inventoryPolicy="CONTINUE", inventoryQuantity=5)
-    c.eq(availability_of(stocked, cfg)[0], "in_stock", "有库存不算 backorder")
+    c.eq(availability_of(stocked, cfg)[0], "in_stock", "stock on hand is not a backorder")
     denied = _variant(availableForSale=True, inventoryPolicy="DENY", inventoryQuantity=0)
     c.eq(availability_of(denied, cfg)[0], "in_stock",
-         "不允许超卖时以 availableForSale 为准（可能没开库存跟踪）")
+         "without overselling, availableForSale wins (inventory tracking may be off)")
 
-    # pre_order 规范要求同时给 availability_date，给不出来就降级
+    # The spec requires availability_date with pre_order, so downgrade when we cannot supply one
     cfg_pre = _cfg(oversell_availability="pre_order")
     avail, date_str = availability_of(oversold, cfg_pre)
-    c.eq(avail, "backorder", "pre_order 缺日期时降级为 backorder")
-    c.eq(date_str, None, "降级后不带日期")
+    c.eq(avail, "backorder", "pre_order without a date downgrades to backorder")
+    c.eq(date_str, None, "no date after the downgrade")
     cfg_pre_days = _cfg(oversell_availability="pre_order", preorder_lead_days=7)
     avail2, date2 = availability_of(oversold, cfg_pre_days)
-    c.eq(avail2, "pre_order", "配了 lead_days 才允许 pre_order")
-    c.ok(bool(date2 and _DATE_RE.match(date2)), "pre_order 日期是 YYYY-MM-DD")
+    c.eq(avail2, "pre_order", "pre_order is only allowed once lead_days is set")
+    c.ok(bool(date2 and _DATE_RE.match(date2)), "the pre_order date is YYYY-MM-DD")
 
 
 def _t_mapping(c: _Check) -> None:
     cfg = _cfg()
     row = map_variant(_variant(), cfg, "USD")
-    c.eq(row["item_id"], "123", "item_id 用变体数字 ID")
-    c.eq(row["group_id"], "900", "group_id 用商品数字 ID")
-    c.eq(row["price"], "29.99 USD", "compareAtPrice 更高时它才是 price")
-    c.eq(row["sale_price"], "19.90 USD", "现价进 sale_price")
-    c.eq(row["gtin"], "0012345678905", "barcode 合法则写 gtin")
-    c.eq(row["url"], "https://example.com/products/tee?variant=123", "url 带 variant 参数")
-    c.eq(row["title"], "Cotton Tee - Blue / M", "多变体时标题拼后缀")
-    c.eq(row["color"], "Blue", "从 selectedOptions 取颜色")
-    c.eq(row["size"], "M", "从 selectedOptions 取尺码")
-    c.eq(row["listing_has_variations"], "true", "variantsCount>1 则有变体")
-    c.eq(row["brand"], "ExampleBrand", "brand 取 vendor")
-    c.eq(row["is_eligible_search"], "true", "布尔是小写字符串")
-    c.eq(row["availability"], "in_stock", "availability 正常")
-    c.ok("cotton tee" in row["description"].lower(), "description 从 HTML 剥出")
-    c.eq(validate(row) + _validate_shape(row), [], "标准行校验无问题")
+    c.eq(row["item_id"], "123", "item_id is the numeric variant ID")
+    c.eq(row["group_id"], "900", "group_id is the numeric product ID")
+    c.eq(row["price"], "29.99 USD", "the higher compareAtPrice becomes price")
+    c.eq(row["sale_price"], "19.90 USD", "the current price becomes sale_price")
+    c.eq(row["gtin"], "0012345678905", "a valid barcode is written as gtin")
+    c.eq(row["url"], "https://example.com/products/tee?variant=123", "url carries the variant param")
+    c.eq(row["title"], "Cotton Tee - Blue / M", "a multi-variant title gets the variant suffix")
+    c.eq(row["color"], "Blue", "color comes from selectedOptions")
+    c.eq(row["size"], "M", "size comes from selectedOptions")
+    c.eq(row["listing_has_variations"], "true", "variantsCount>1 means the listing has variations")
+    c.eq(row["brand"], "ExampleBrand", "brand comes from vendor")
+    c.eq(row["is_eligible_search"], "true", "booleans are lower-case strings")
+    c.eq(row["availability"], "in_stock", "availability is normal")
+    c.ok("cotton tee" in row["description"].lower(), "description is stripped out of the HTML")
+    c.eq(validate(row) + _validate_shape(row), [], "a standard row validates cleanly")
 
 def _t_skips(c: _Check) -> None:
     cfg = _cfg()
     cases = [
-        ("非 ACTIVE", _variant(product={"status": "DRAFT"})),
-        ("无在线 URL", _variant(product={"onlineStoreUrl": ""})),
-        ("价格为 0", _variant(price="0")),
-        ("价格非法", _variant(price="abc")),
-        ("没有图片", _variant(product={"featuredMedia": None})),
+        ("not ACTIVE", _variant(product={"status": "DRAFT"})),
+        ("no online URL", _variant(product={"onlineStoreUrl": ""})),
+        ("price is 0", _variant(price="0")),
+        ("price is not a number", _variant(price="abc")),
+        ("no image", _variant(product={"featuredMedia": None})),
     ]
     for label, variant in cases:
-        c.raises(SkipRow, lambda v=variant: map_variant(v, cfg, "USD"), f"应跳过：{label}")
+        c.raises(SkipRow, lambda v=variant: map_variant(v, cfg, "USD"), f"should skip: {label}")
 
     tagged = _variant(product={"tags": ["clearance"]})
     c.raises(SkipRow, lambda: map_variant(tagged, _cfg(exclude_tags=["Clearance"]), "USD"),
-             "排除标签大小写不敏感")
+             "excluded tags are case-insensitive")
     c.raises(SkipRow, lambda: map_variant(_variant(price="5"), _cfg(min_price="10"), "USD"),
-             "低于 min_price 被跳过")
+             "below min_price is skipped")
     no_brand = _variant(product={"vendor": ""})
     c.raises(SkipRow, lambda: map_variant(no_brand, _cfg(default_brand=""), "USD"),
-             "brand 为空且无兜底则跳过")
+             "an empty brand with no fallback is skipped")
     c.eq(map_variant(no_brand, _cfg(default_brand="Fallback"), "USD")["brand"], "Fallback",
-         "default_brand 兜底生效")
+         "default_brand fills in")
 
-    # compareAtPrice 不高于 price 时不该产生 sale_price
+    # compareAtPrice at or below price must not produce a sale_price
     no_sale = map_variant(_variant(compareAtPrice="10.00", price="19.90"), cfg, "USD")
-    c.eq(no_sale["price"], "19.90 USD", "compareAtPrice 更低时忽略它")
-    c.eq(no_sale.get("sale_price", ""), "", "没打折就不写 sale_price")
+    c.eq(no_sale["price"], "19.90 USD", "a lower compareAtPrice is ignored")
+    c.eq(no_sale.get("sale_price", ""), "", "no discount means no sale_price")
     single = map_variant(_variant(title="Default Title", product={"variantsCount": {"count": 1}}), cfg, "USD")
-    c.eq(single["title"], "Cotton Tee", "单变体不拼标题后缀")
-    c.eq(single["listing_has_variations"], "false", "单变体 listing_has_variations=false")
+    c.eq(single["title"], "Cotton Tee", "a single variant gets no title suffix")
+    c.eq(single["listing_has_variations"], "false", "a single variant means listing_has_variations=false")
 
 
 def _t_validate(c: _Check) -> None:
     base = map_variant(_variant(), _cfg(), "USD")
     c.ok(any("availability" in p for p in validate({**base, "availability": "sold_out"})),
-         "非法 availability 被抓")
+         "an illegal availability is caught")
     c.ok(any("price" in p for p in validate({**base, "price": "19.9 USD"})),
-         "price 少一位小数被抓")
+         "a price with one decimal is caught")
     c.ok(any("price" in p for p in validate({**base, "price": "19.90"})),
-         "price 缺币种被抓")
+         "a price without a currency is caught")
     c.ok(validate({**base, "sale_price": "29.99 USD", "price": "29.99 USD"}) == [],
-         "sale_price 等于 price 是合法的（规范是 <=）")
+         "sale_price equal to price is legal (the spec says <=)")
     c.ok(any("sale_price" in p for p in validate({**base, "sale_price": "39.99 USD"})),
-         "sale_price 高于 price 被抓")
+         "a sale_price above price is caught")
     c.ok(any("sale_price" in p for p in validate({**base, "sale_price": "9.99 EUR"})),
-         "sale_price 币种不一致被抓")
-    c.ok(any("item_id" in p for p in validate({**base, "item_id": ""})), "必填字段为空被抓")
-    c.ok(any("规范外字段" in p for p in _validate_shape({**base, "bogus_col": "x"})),
-         "未知列被抓")
+         "a sale_price in another currency is caught")
+    c.ok(any("item_id" in p for p in validate({**base, "item_id": ""})), "an empty required field is caught")
+    c.ok(any("outside the spec" in p for p in _validate_shape({**base, "bogus_col": "x"})),
+         "an unknown column is caught")
     c.ok(any("gtin" in p for p in _validate_shape({**base, "gtin": "0012345678904"})),
-         "gtin 校验位错被抓")
+         "a wrong gtin check digit is caught")
     c.ok(any("title" in p for p in _validate_shape({**base, "title": "x" * 200})),
-         "title 超长被抓")
+         "an over-long title is caught")
     c.ok(any("age_group" in p for p in _validate_shape({**base, "age_group": "teen"})),
-         "非法 age_group 被抓")
+         "an illegal age_group is caught")
     pre = {**base, "availability": "pre_order"}
-    c.ok(any("availability_date" in p for p in validate(pre)), "pre_order 缺日期被抓")
+    c.ok(any("availability_date" in p for p in validate(pre)), "pre_order without a date is caught")
 
 def _t_config(c: _Check) -> None:
-    c.raises(ConfigError, lambda: _cfg(output_format="xml"), "非法 output_format")
+    c.raises(ConfigError, lambda: _cfg(output_format="xml"), "an illegal output_format")
     c.raises(ConfigError, lambda: _cfg(remote_filename="products.csv.gz"),
-             "远端后缀与格式不一致")
+             "a remote suffix that does not match the format")
     c.raises(ConfigError, lambda: _cfg(is_eligible_search=False, is_eligible_checkout=True),
-             "checkout 依赖 search")
+             "checkout depends on search")
     c.raises(ConfigError, lambda: _cfg(is_eligible_checkout=True),
-             "checkout 缺隐私政策与 TOS")
-    c.raises(ConfigError, lambda: _cfg(seller_url="notaurl"), "seller_url 非法")
-    c.raises(ConfigError, lambda: _cfg(target_countries=["USA"]), "国家码必须两位")
-    c.raises(ConfigError, lambda: _cfg(store_country="usa"), "store_country 必须两位")
-    c.raises(ConfigError, lambda: _cfg(page_size=500), "page_size 上限 250")
-    c.raises(ConfigError, lambda: _cfg(shard_count=0), "shard_count 下限 1")
-    c.raises(ConfigError, lambda: _cfg(max_reject_ratio=1.5), "拒收率阈值范围")
-    c.raises(ConfigError, lambda: _cfg(min_price="-1"), "min_price 不能为负")
-    c.raises(ConfigError, lambda: _cfg(condition="brand-new"), "condition 枚举")
+             "checkout without a privacy policy and TOS")
+    c.raises(ConfigError, lambda: _cfg(seller_url="notaurl"), "an illegal seller_url")
+    c.raises(ConfigError, lambda: _cfg(target_countries=["USA"]), "country codes must be two letters")
+    c.raises(ConfigError, lambda: _cfg(store_country="usa"), "store_country must be two letters")
+    c.raises(ConfigError, lambda: _cfg(page_size=500), "page_size caps at 250")
+    c.raises(ConfigError, lambda: _cfg(shard_count=0), "shard_count starts at 1")
+    c.raises(ConfigError, lambda: _cfg(max_reject_ratio=1.5), "the reject ratio threshold range")
+    c.raises(ConfigError, lambda: _cfg(min_price="-1"), "min_price cannot be negative")
+    c.raises(ConfigError, lambda: _cfg(condition="brand-new"), "the condition enum")
     c.raises(ConfigError, lambda: _cfg(metafields={"nope_field": "ns.key"}),
-             "metafield 目标必须是规范字段")
+             "a metafield target must be a spec field")
     c.raises(ConfigError, lambda: _cfg(metafields={"color": "bad key!"}),
-             "metafield 引用格式")
+             "the metafield reference format")
     cfg = _cfg(target_countries="us", metafields={"color": "custom.shade"})
-    c.eq(cfg["target_countries"], ["US"], "单字符串国家码归一成列表")
-    c.eq(cfg["_metafields"]["color"], ("custom", "shade"), "metafield 引用解析")
+    c.eq(cfg["target_countries"], ["US"], "a single country string becomes a list")
+    c.eq(cfg["_metafields"]["color"], ("custom", "shade"), "the metafield reference is parsed")
 
 
 def _t_state(c: _Check) -> None:
     row = map_variant(_variant(), _cfg(), "USD")
     fp = fingerprint(row)
-    c.ok(fp.count("\x1f") == 4, "指纹 5 段")
-    c.eq(_unpack(fp)[4], "900", "指纹末位是 group_id")
+    c.ok(fp.count("\x1f") == 4, "a fingerprint has 5 segments")
+    c.eq(_unpack(fp)[4], "900", "the last fingerprint segment is group_id")
     changed = fingerprint({**row, "availability": "out_of_stock"})
-    c.ok(fp != changed, "库存变化改变指纹")
+    c.ok(fp != changed, "a stock change changes the fingerprint")
 
     old = {"a": "in_stock\x1f10.00 USD\x1f\x1fA\x1fp1",
            "b": "in_stock\x1f10.00 USD\x1f\x1fB\x1fp1"}
     new = {"a": "out_of_stock\x1f10.00 USD\x1f\x1fA\x1fp1",
            "c": "in_stock\x1f5.00 USD\x1f\x1fC\x1fp2"}
     d = diff_state(old, new)
-    c.eq(d["added"], ["c"], "diff 认出新增")
-    c.eq(d["removed"], ["b"], "diff 认出下架")
-    c.eq(d["stock_changed"], ["a"], "diff 认出库存变化")
-    c.eq(d["price_changed"], [], "价格没变就不报价格变化")
-    c.ok(not d["first_run"], "有基线时 first_run=false")
+    c.eq(d["added"], ["c"], "diff spots an addition")
+    c.eq(d["removed"], ["b"], "diff spots a removal")
+    c.eq(d["stock_changed"], ["a"], "diff spots a stock change")
+    c.eq(d["price_changed"], [], "an unchanged price is not reported as a price change")
+    c.ok(not d["first_run"], "with a baseline, first_run=false")
     d2 = diff_state({}, new)
-    c.ok(d2["first_run"], "空基线即首次运行")
+    c.ok(d2["first_run"], "an empty baseline is a first run")
 
     price_new = {"a": "in_stock\x1f12.00 USD\x1f\x1fA\x1fp1"}
     d3 = diff_state({"a": old["a"]}, price_new)
-    c.eq(d3["price_changed"], ["a"], "diff 认出价格变化")
-    c.eq(d3["stock_changed"], [], "价格变化不算库存变化")
+    c.eq(d3["price_changed"], ["a"], "diff spots a price change")
+    c.eq(d3["stock_changed"], [], "a price change is not a stock change")
 
 def _t_delta(c: _Check) -> None:
     state = {
@@ -2129,21 +2139,21 @@ def _t_delta(c: _Check) -> None:
     }
     products = build_delta_products(["v1", "v2", "v3", "v4", "v5", "v1"], state, False)
     by_id = {p["id"]: p for p in products}
-    c.eq(sorted(by_id), ["p1", "p2"], "按父商品聚合，unknown 与无父 ID 被剔除")
-    c.eq(len(by_id["p1"]["variants"]), 2, "同父商品的变体合并，重复 id 去掉")
+    c.eq(sorted(by_id), ["p1", "p2"], "grouped by parent product, unknown and parentless rows dropped")
+    c.eq(len(by_id["p1"]["variants"]), 2, "variants of one parent merge and duplicate ids drop out")
     v1 = next(v for v in by_id["p1"]["variants"] if v["id"] == "v1")
     c.eq(v1["availability"], {"available": False, "status": "out_of_stock"},
-         "availability 是对象且 available 与 status 一致")
+         "availability is an object whose available matches status")
     v3 = by_id["p2"]["variants"][0]
-    c.eq(v3["availability"]["available"], True, "backorder 视为可售")
-    c.eq(v3["availability"]["status"], "backorder", "status 透传原枚举")
-    c.ok("title" not in v1, "默认不推标题")
+    c.eq(v3["availability"]["available"], True, "backorder counts as available")
+    c.eq(v3["availability"]["status"], "backorder", "status passes the original enum through")
+    c.ok("title" not in v1, "the title is not pushed by default")
     with_title = build_delta_products(["v1"], state, True)
-    c.eq(with_title[0]["variants"][0]["title"], "Shirt A", "开了开关才推标题")
-    c.eq(build_delta_products([], state, False), [], "空输入返回空")
+    c.eq(with_title[0]["variants"][0]["title"], "Shirt A", "the title is pushed only with the switch on")
+    c.eq(build_delta_products([], state, False), [], "empty input returns empty")
     c.eq(_delta_error_code('{"error":{"code":"product_feed_delta_api_disabled"}}'),
-         "product_feed_delta_api_disabled", "解析错误码")
-    c.eq(_delta_error_code("not json"), "", "错误码解析容错")
+         "product_feed_delta_api_disabled", "the error code is parsed")
+    c.eq(_delta_error_code("not json"), "", "error code parsing tolerates non-JSON")
 
 
 def _t_writer(c: _Check) -> None:
@@ -2157,22 +2167,23 @@ def _t_writer(c: _Check) -> None:
         for r in rows:
             w.write(r)
         paths = w.close()
-        c.eq(len(paths), 1, "单分片只产一个文件")
-        c.ok(out.exists(), "输出文件已落位")
-        c.ok(not out.with_name(out.name + ".partial").exists(), ".partial 已被 rename 掉")
+        c.eq(len(paths), 1, "a single shard produces one file")
+        c.ok(out.exists(), "the output file is in place")
+        c.ok(not out.with_name(out.name + ".partial").exists(), ".partial has been renamed away")
         with gzip.open(out, "rt", encoding="utf-8") as fh:
             lines = [json.loads(x) for x in fh if x.strip()]
-        c.eq(len(lines), 2, "jsonl 行数正确")
-        c.eq(lines[0]["item_id"], "123", "jsonl 内容正确")
-        c.ok("bogus" not in lines[0], "只写规范字段")
+        c.eq(len(lines), 2, "the jsonl line count is right")
+        c.eq(lines[0]["item_id"], "123", "the jsonl content is right")
+        c.ok("bogus" not in lines[0], "only spec fields are written")
 
-        # mtime=0 + 固定压缩级别 ⇒ 同内容必须同字节，否则「内容未变」判断失效
+        # mtime=0 plus a fixed compression level means identical content gives identical
+        # bytes; without that the "content unchanged" check would be useless
         out2 = base / "again.jsonl.gz"
         w2 = FeedWriter(str(out2), "jsonl.gz", 1)
         for r in rows:
             w2.write(r)
         w2.close()
-        c.eq(sha256_of(out), sha256_of(out2), "同内容产出同字节（gzip 可复现）")
+        c.eq(sha256_of(out), sha256_of(out2), "identical content produces identical bytes (gzip is reproducible)")
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -2181,7 +2192,7 @@ def _t_writer_more(c: _Check) -> None:
     shutil.rmtree(base, ignore_errors=True)
     cfg = _cfg()
     try:
-        # CSV 表头必须是完整的 44 列，顺序固定
+        # The CSV header must carry every column, in a fixed order
         out = base / "p.csv.gz"
         w = FeedWriter(str(out), "csv.gz", 1)
         w.write(map_variant(_variant(), cfg, "USD"))
@@ -2190,38 +2201,38 @@ def _t_writer_more(c: _Check) -> None:
             reader = csv.reader(fh)
             header = next(reader)
             data = next(reader)
-        c.eq(tuple(header), FEED_COLUMNS, "CSV 表头与列定义一致")
-        c.eq(len(data), len(FEED_COLUMNS), "CSV 数据列数对齐")
+        c.eq(tuple(header), FEED_COLUMNS, "the CSV header matches the column definition")
+        c.eq(len(data), len(FEED_COLUMNS), "the CSV data has the same column count")
         c.eq(data[header.index("additional_image_urls")].count(","), 0,
-             "单张附图不产生多余逗号")
+             "a single extra image produces no stray comma")
 
-        # 分片：同一 item_id 必须稳定落在同一分片（跨进程也一样）
+        # Sharding: one item_id must always land in the same shard, across processes too
         shards = base / "s.jsonl.gz"
         w3 = FeedWriter(str(shards), "jsonl.gz", 4)
-        c.eq(len(w3.shards), 4, "按 shard_count 开够分片")
+        c.eq(len(w3.shards), 4, "opens as many shards as shard_count")
         names = [s.path.name for s in w3.shards]
-        c.eq(names[0], "s-0000.jsonl.gz", "分片命名插在后缀前")
+        c.eq(names[0], "s-0000.jsonl.gz", "shard numbering goes before the suffix")
         idx = hashlib.sha1(b"123").digest()[0] % 4
         w3.write(map_variant(_variant(), cfg, "USD"))
-        c.eq(w3.shards[idx].count, 1, "路由到 sha1 决定的分片")
+        c.eq(w3.shards[idx].count, 1, "routed to the shard sha1 picks")
         paths = w3.close()
-        c.eq(len(paths), 4, "空分片也要落地（分片集合必须稳定）")
-        c.ok(all(p.exists() for p in paths), "所有分片文件都存在")
+        c.eq(len(paths), 4, "empty shards are written too (the shard set must stay stable)")
+        c.ok(all(p.exists() for p in paths), "every shard file exists")
 
-        # abort 必须清掉 .partial，绝不让半截文件顶掉上一版
+        # abort must clear .partial; a half-written file must never replace the previous one
         w4 = FeedWriter(str(base / "a.jsonl.gz"), "jsonl.gz", 1)
         w4.write(map_variant(_variant(), cfg, "USD"))
         partial = w4.shards[0].tmp
-        c.ok(partial.exists(), "写入中存在 .partial")
+        c.ok(partial.exists(), ".partial exists while writing")
         w4.abort()
-        c.ok(not partial.exists(), "abort 清掉 .partial")
-        c.ok(not (base / "a.jsonl.gz").exists(), "abort 不产出正式文件")
+        c.ok(not partial.exists(), "abort clears .partial")
+        c.ok(not (base / "a.jsonl.gz").exists(), "abort produces no final file")
 
-        c.eq(shard_name("p.jsonl.gz", 0, 1), "p.jsonl.gz", "单分片不改名")
-        c.eq(shard_name("p.parquet", 2, 3), "p-0002.parquet", "parquet 分片命名")
-        c.eq(flatten_value(["a", "b"]), "a,b", "列表拼逗号")
-        c.eq(flatten_value(True), "true", "布尔转小写字符串")
-        c.eq(flatten_value(None), "", "None 转空串")
+        c.eq(shard_name("p.jsonl.gz", 0, 1), "p.jsonl.gz", "a single shard keeps the base name")
+        c.eq(shard_name("p.parquet", 2, 3), "p-0002.parquet", "parquet shard naming")
+        c.eq(flatten_value(["a", "b"]), "a,b", "a list joins with commas")
+        c.eq(flatten_value(True), "true", "a bool becomes a lower-case string")
+        c.eq(flatten_value(None), "", "None becomes an empty string")
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -2232,112 +2243,112 @@ def _t_collect(c: _Check) -> None:
         _variant(id="gid://shopify/ProductVariant/124"),
         _variant(id="gid://shopify/ProductVariant/125", product={"status": "DRAFT"}),
         _variant(id="gid://shopify/ProductVariant/126", price="0"),
-        _variant(),  # 重复 item_id
+        _variant(),  # duplicate item_id
     ]
     res = collect(variants, cfg, "USD", None)
-    c.eq(res["written"], 2, "只写通过的行")
-    c.eq(res["skipped"], 2, "跳过 DRAFT 与 0 价")
-    c.eq(res["dupes"], 1, "重复 item_id 计入 dupes")
-    c.eq(res["products"], 1, "两个变体同属一个商品")
-    c.eq(len(res["state"]), 2, "状态里只有写出去的行")
-    c.ok(res["reasons"], "拒收原因有记录")
-    c.ok(all(len(s) == 3 for s in res["samples"]), "样本是三元组")
+    c.eq(res["written"], 2, "only passing rows are written")
+    c.eq(res["skipped"], 2, "the DRAFT and the zero-price row are skipped")
+    c.eq(res["dupes"], 1, "a duplicate item_id counts as a dupe")
+    c.eq(res["products"], 1, "both variants belong to one product")
+    c.eq(len(res["state"]), 2, "state holds only the rows written")
+    c.ok(res["reasons"], "reject reasons are recorded")
+    c.ok(all(len(s) == 3 for s in res["samples"]), "samples are 3-tuples")
 
     limited = collect([_variant(), _variant(id="gid://shopify/ProductVariant/124")],
                       cfg, "USD", None, limit=1)
-    c.eq(limited["written"], 1, "--limit 生效")
+    c.eq(limited["written"], 1, "--limit takes effect")
 
-    # 数据闸门
+    # Data guards
     c.raises(DataGuardError, lambda: _guard_snapshot(
         {"written": 0, "skipped": 3, "invalid": 0, "dupes": 0, "reasons": {}}, cfg),
-        "空快照被拦住")
+        "an empty snapshot is blocked")
     c.raises(DataGuardError, lambda: _guard_snapshot(
         {"written": 5, "skipped": 0, "invalid": 0, "dupes": 0, "reasons": {}},
-        _cfg(min_rows=10)), "低于 min_rows 被拦住")
+        _cfg(min_rows=10)), "below min_rows is blocked")
     c.raises(DataGuardError, lambda: _guard_snapshot(
         {"written": 10, "skipped": 90, "invalid": 0, "dupes": 0, "reasons": {"x": 90}}, cfg),
-        "拒收率过高被拦住")
+        "too high a reject ratio is blocked")
     _guard_snapshot({"written": 100, "skipped": 5, "invalid": 0, "dupes": 0, "reasons": {}}, cfg)
-    c.passed += 1  # 正常快照不抛
+    c.passed += 1  # a healthy snapshot raises nothing
 
 
 def _t_query(c: _Check) -> None:
     cfg = _cfg(metafields={"color": "custom.shade"})
     q = build_variants_query(set(OPTIONAL_GROUPS), cfg["_metafields"], True)
-    c.ok("productVariants(" in q, "查的是 productVariants")
-    c.ok("product_status:active" in q, "带上 active 过滤")
-    c.ok("inventoryQuantity" in q, "含库存字段组")
-    c.ok('mf0: metafield(namespace: "custom", key: "shade")' in q, "metafield 别名注入")
-    c.ok("pageInfo" in q and "endCursor" in q, "含游标分页")
+    c.ok("productVariants(" in q, "it queries productVariants")
+    c.ok("product_status:active" in q, "it carries the active filter")
+    c.ok("inventoryQuantity" in q, "it includes the inventory field group")
+    c.ok('mf0: metafield(namespace: "custom", key: "shade")' in q, "the metafield alias is injected")
+    c.ok("pageInfo" in q and "endCursor" in q, "it includes cursor pagination")
     q2 = build_variants_query(set(), cfg["_metafields"], False)
-    c.ok("inventoryQuantity" not in q2, "降级后不再请求库存")
-    c.ok("product_status:active" not in q2, "关掉状态过滤后 query 参数消失")
-    c.ok("id" in q2 and "price" in q2, "核心字段永远保留")
-    # bulk 不允许嵌套连接带分页参数，media 组必须摘掉
+    c.ok("inventoryQuantity" not in q2, "after degrading, inventory is no longer requested")
+    c.ok("product_status:active" not in q2, "with the status filter off the query argument disappears")
+    c.ok("id" in q2 and "price" in q2, "core fields are always kept")
+    # bulk forbids pagination arguments on nested connections, so the media group must go
     bq = Shopify("x.myshopify.com", "t", DEFAULT_SHOPIFY_API_VERSION).build_bulk_query(cfg)
-    c.ok("media(first:" not in bq, "bulk 查询不带 media 分页参数")
-    c.ok("pageInfo" not in bq, "bulk 查询不需要 pageInfo")
+    c.ok("media(first:" not in bq, "the bulk query carries no media pagination argument")
+    c.ok("pageInfo" not in bq, "the bulk query needs no pageInfo")
 
 def _t_degrade(c: _Check) -> None:
     def errs(*messages: str) -> str:
-        # 真实调用方传的是 json.dumps(payload["errors"])，这里保持同一形状
+        # The real caller passes json.dumps(payload["errors"]); keep the same shape here
         return json.dumps([{"message": m} for m in messages], ensure_ascii=False)
 
     client = Shopify("x.myshopify.com", "t", DEFAULT_SHOPIFY_API_VERSION)
-    # 只授 read_products 时，库存字段会让整条 query 失败
+    # With only read_products granted, the inventory fields fail the whole query
     dropped = client._drop_group_for(
         errs("Field 'inventoryQuantity' doesn't exist on type 'ProductVariant'"))
-    c.eq(dropped, "inventory", "按报错字段名定位到 inventory 组")
-    c.ok("inventory" not in client.groups, "该组已从后续 query 摘掉")
-    c.ok("variant_image" in client.groups, "只摘中招的那一组")
+    c.eq(dropped, "inventory", "the field name in the error locates the inventory group")
+    c.ok("inventory" not in client.groups, "that group is dropped from later queries")
+    c.ok("variant_image" in client.groups, "only the offending group is dropped")
     again = client._drop_group_for(errs("Field 'inventoryQuantity' doesn't exist"))
-    c.ok(again != "inventory", "同一组不会被摘两次")
+    c.ok(again != "inventory", "the same group is not dropped twice")
 
     c2 = Shopify("x.myshopify.com", "t", DEFAULT_SHOPIFY_API_VERSION)
     c2._drop_group_for(errs("Invalid argument in query: product_status"))
-    c.ok(not c2.use_status_filter, "认不出字段名时先退回关掉状态过滤")
+    c.ok(not c2.use_status_filter, "with no field name to go on, the status filter is dropped first")
     c3b = Shopify("x.myshopify.com", "t", DEFAULT_SHOPIFY_API_VERSION)
-    c.eq(c3b._drop_group_for(errs("Field 'seo' doesn't exist")), "seo", "定位到 seo 组")
+    c.eq(c3b._drop_group_for(errs("Field 'seo' doesn't exist")), "seo", "it locates the seo group")
 
-    # 限流：剩余点数不足时应该算出等待时间
+    # Throttling: too few points left must produce a wait
     c3 = Shopify("x.myshopify.com", "t", DEFAULT_SHOPIFY_API_VERSION)
     c3._absorb_cost({"cost": {"throttleStatus": {"currentlyAvailable": 20, "restoreRate": 50}}})
-    c.eq(c3.available_points, 20.0, "读到剩余点数")
-    c.eq(c3.restore_rate, 50.0, "读到恢复速率")
+    c.eq(c3.available_points, 20.0, "it reads the points left")
+    c.eq(c3.restore_rate, 50.0, "it reads the restore rate")
     start = time.time()
     c3.pace(next_cost=30.0)
-    c.ok(time.time() - start >= 0.15, "点数不够时确实睡了一下")
+    c.ok(time.time() - start >= 0.15, "too few points really does sleep")
     c4 = Shopify("x.myshopify.com", "t", DEFAULT_SHOPIFY_API_VERSION)
     c4._absorb_cost({"cost": {"throttleStatus": {"currentlyAvailable": 900, "restoreRate": 50}}})
     t2 = time.time()
     c4.pace(next_cost=30.0)
-    c.ok(time.time() - t2 < 0.1, "点数充足时不睡")
+    c.ok(time.time() - t2 < 0.1, "plenty of points means no sleep")
 
 
 def _t_misc(c: _Check) -> None:
-    c.eq(_remote_join("/in", "p.jsonl.gz"), "/in/p.jsonl.gz", "远端路径拼接")
-    c.eq(_remote_join(".", "p.jsonl.gz"), "p.jsonl.gz", "当前目录不加前缀")
-    c.eq(_remote_join("", "p.jsonl.gz"), "p.jsonl.gz", "空目录不加前缀")
-    c.eq(_remote_join("/in/", "p.jsonl.gz"), "/in/p.jsonl.gz", "去掉重复斜杠")
-    c.eq(_status_text({"ok": True}), "success", "状态文案 success")
-    c.eq(_status_text({"skipped": "x"}), "skipped（x）", "状态文案 skipped")
-    c.ok(_status_text({"errors": ["boom"]}).startswith("failed"), "状态文案 failed")
-    c.eq(len(REQUIRED_FIELDS), 15, "必填字段 15 个")
-    c.eq(len(set(FEED_COLUMNS)), len(FEED_COLUMNS), "列定义无重复")
-    c.ok(all(f in FEED_COLUMNS for f in REQUIRED_FIELDS), "必填字段都在列定义里")
-    c.ok("inventory_quantity" not in FEED_COLUMNS, "规范里没有 inventory_quantity 这个字段")
-    c.ok("is_ads_enabled" not in FEED_COLUMNS, "is_ads_enabled 不是合法字段名")
-    c.ok("additional_image_urls" in FEED_COLUMNS, "附图字段是复数形式")
-    c.ok("is_ads_eligible" in FEED_COLUMNS, "广告资格字段名正确")
+    c.eq(_remote_join("/in", "p.jsonl.gz"), "/in/p.jsonl.gz", "remote path join")
+    c.eq(_remote_join(".", "p.jsonl.gz"), "p.jsonl.gz", "the current directory adds no prefix")
+    c.eq(_remote_join("", "p.jsonl.gz"), "p.jsonl.gz", "an empty directory adds no prefix")
+    c.eq(_remote_join("/in/", "p.jsonl.gz"), "/in/p.jsonl.gz", "a duplicate slash is removed")
+    c.eq(_status_text({"ok": True}), "success", "status text success")
+    c.eq(_status_text({"skipped": "x"}), "skipped (x)", "status text skipped")
+    c.ok(_status_text({"errors": ["boom"]}).startswith("failed"), "status text failed")
+    c.eq(len(REQUIRED_FIELDS), 15, "15 required fields")
+    c.eq(len(set(FEED_COLUMNS)), len(FEED_COLUMNS), "no duplicate columns")
+    c.ok(all(f in FEED_COLUMNS for f in REQUIRED_FIELDS), "every required field is a defined column")
+    c.ok("inventory_quantity" not in FEED_COLUMNS, "the spec has no inventory_quantity field")
+    c.ok("is_ads_enabled" not in FEED_COLUMNS, "is_ads_enabled is not a legal field name")
+    c.ok("additional_image_urls" in FEED_COLUMNS, "the extra-image field is plural")
+    c.ok("is_ads_eligible" in FEED_COLUMNS, "the ads-eligibility field name is right")
     state_file = Path(os.environ.get("TMPDIR", "/tmp")) / f"st_{os.getpid()}.json"
     try:
         save_state(str(state_file), {"a": "x"}, "deadbeef")
         loaded = load_state(str(state_file))
-        c.eq(loaded["items"], {"a": "x"}, "状态可写可读")
-        c.eq(loaded["content_sha256"], "deadbeef", "指纹落盘")
+        c.eq(loaded["items"], {"a": "x"}, "state round-trips")
+        c.eq(loaded["content_sha256"], "deadbeef", "the fingerprint is persisted")
         state_file.write_text("{ broken", "utf-8")
-        c.eq(load_state(str(state_file))["items"], {}, "坏状态文件按首次运行处理")
-        c.eq(load_state(str(state_file / "nope"))["items"], {}, "状态文件不存在也不报错")
+        c.eq(load_state(str(state_file))["items"], {}, "a broken state file is treated as a first run")
+        c.eq(load_state(str(state_file / "nope"))["items"], {}, "a missing state file does not raise")
     finally:
         state_file.unlink(missing_ok=True)
 
@@ -2354,26 +2365,26 @@ def self_test() -> int:
         try:
             fn(c)
         except Exception as exc:  # noqa: BLE001
-            c.failed.append(f"{fn.__name__} 抛异常: {type(exc).__name__}: {redact(exc)}")
+            c.failed.append(f"{fn.__name__} raised: {type(exc).__name__}: {redact(exc)}")
     if c.failed:
-        log(f"自检失败 {len(c.failed)} 项 / 通过 {c.passed} 项：")
+        log(f"self-test failed {len(c.failed)} / passed {c.passed}:")
         for item in c.failed:
             log(f"  ✗ {item}")
         return EXIT_RUNTIME
-    log(f"自检全绿：{c.passed} 项断言通过")
+    log(f"self-test all green: {c.passed} assertions passed")
     return EXIT_OK
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="feed_sync.py",
-        description="把 Shopify 目录转成 OpenAI 商品 feed 并投递（全量快照 + 可选 Delta）",
+        description="Turn a Shopify catalog into an OpenAI product feed and deliver it (full snapshot plus optional Delta)",
     )
-    p.add_argument("--config", default="config.json", help="业务配置路径（凭证走环境变量）")
-    p.add_argument("--dry-run", action="store_true", help="只在本地产出文件，不上传、不写状态")
-    p.add_argument("--limit", type=int, default=0, help="只处理前 N 条，用于试跑（不写状态）")
-    p.add_argument("--bulk", action="store_true", help="用 Bulk Operations 抓取（大目录更稳）")
-    p.add_argument("--delta", action="store_true", help="额外用 Delta API 推库存变化")
-    p.add_argument("--self-test", action="store_true", help="跑内置断言，不联网")
+    p.add_argument("--config", default="config.json", help="path to the business config (credentials come from the environment)")
+    p.add_argument("--dry-run", action="store_true", help="write files locally only: no upload, no state")
+    p.add_argument("--limit", type=int, default=0, help="process the first N rows only, for a trial run (state is not written)")
+    p.add_argument("--bulk", action="store_true", help="fetch with Bulk Operations (steadier on large catalogs)")
+    p.add_argument("--delta", action="store_true", help="also push availability changes through the Delta API")
+    p.add_argument("--self-test", action="store_true", help="run the built-in assertions, no network")
     return p
 
 
@@ -2382,24 +2393,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return self_test()
     if args.limit < 0:
-        log("--limit 不能为负")
+        log("--limit cannot be negative")
         return EXIT_CONFIG
     try:
         return run(args)
     except ConfigError as exc:
-        log(f"配置错误：{redact(exc)}")
+        log(f"config error: {redact(exc)}")
         return EXIT_CONFIG
     except DataGuardError as exc:
-        log(f"数据闸门拦下本次发布：{redact(exc)}")
-        notify_discord("GPT Ads Feed 已拦停（数据异常）", [("原因", str(exc)[:1000])], ok=False)
+        log(f"data guard blocked this publish: {redact(exc)}")
+        notify_discord("GPT Ads Feed halted (data guard)", [("Reason", str(exc)[:1000])], ok=False)
         return EXIT_DATA_GUARD
     except KeyboardInterrupt:
-        log("已中断")
+        log("interrupted")
         return EXIT_RUNTIME
     except Exception as exc:  # noqa: BLE001
-        log(f"运行失败：{type(exc).__name__}: {redact(exc)}")
-        notify_discord("GPT Ads Feed 更新失败",
-                       [("异常", f"{type(exc).__name__}: {redact(exc)}"[:1000])], ok=False)
+        log(f"run failed: {type(exc).__name__}: {redact(exc)}")
+        notify_discord("GPT Ads Feed update failed",
+                       [("Exception", f"{type(exc).__name__}: {redact(exc)}"[:1000])], ok=False)
         return EXIT_RUNTIME
 
 

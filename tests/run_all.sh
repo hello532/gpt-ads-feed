@@ -1,5 +1,5 @@
 #!/bin/bash
-# 一条命令跑完三层验证。不出网、不用真凭证，随时可跑。
+# Runs all three layers in one command. No network, no real credentials, safe to run any time.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,20 +9,20 @@ FAIL=0
 run() {
   local label="$1"; shift
   echo "── $label ──"
-  # -B 避免生成 __pycache__
+  # -B keeps __pycache__ from being written
   if ! "$PY" -B "$@"; then
     FAIL=1
-    echo "   ↑ 这一层失败"
+    echo "   ^ this layer failed"
   fi
   echo
 }
 
-run "单元自检（函数级）" "$HERE/../feed_sync.py" --self-test
-run "端到端（编排链路）" "$HERE/test_e2e.py"
-run "守卫分支（缺依赖/缺凭证）" "$HERE/test_guards.py"
+run "unit self-test (function level)" "$HERE/../feed_sync.py" --self-test
+run "end-to-end (orchestration path)" "$HERE/test_e2e.py"
+run "guard branches (missing dependency / missing credentials)" "$HERE/test_guards.py"
 
 if [[ $FAIL -ne 0 ]]; then
-  echo "有失败项，别发布"
+  echo "there are failures, do not publish"
   exit 1
 fi
-echo "三层全绿"
+echo "all three layers green"

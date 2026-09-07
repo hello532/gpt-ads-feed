@@ -90,8 +90,6 @@ ssh-keyscan -p 22 <sftp-host> >> ~/.ssh/known_hosts
 
 ## Things that bit us, already handled in the code
 
-This section is the reason to hire whoever wrote it. Each item cost a debugging session.
-
 **A missing `read_inventory` scope kills the entire query.** Those fields do not come
 back empty — the whole GraphQL request returns `ACCESS_DENIED`. So fields are organised
 into groups: recognise the offending field name in the error text, drop *only that

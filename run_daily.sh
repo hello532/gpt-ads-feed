@@ -1,5 +1,5 @@
 #!/bin/bash
-# launchd 入口。launchd 不读 shell profile，所以凭证必须在这里显式加载。
+# launchd entry point. launchd does not read a shell profile, so credentials must be loaded explicitly here.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,15 +10,15 @@ LOG_DIR="${GPT_ADS_FEED_LOG_DIR:-$HOME/Library/Logs/gpt-ads-feed}"
 mkdir -p "$LOG_DIR"
 
 if [[ ! -f "$ENV_FILE" ]]; then
-  echo "缺少凭证文件 $ENV_FILE（参考 env.example）" >&2
+  echo "credentials file $ENV_FILE is missing (see env.example)" >&2
   exit 2
 fi
 if [[ ! -f "$CONFIG" ]]; then
-  echo "缺少配置文件 $CONFIG（参考 config.example.json）" >&2
+  echo "config file $CONFIG is missing (see config.example.json)" >&2
   exit 2
 fi
 
-# 只导出 KEY=VALUE 行，忽略注释与空行；不 echo 任何值
+# Export KEY=VALUE lines only, ignoring comments and blank lines; never echo a value
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
