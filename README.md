@@ -179,6 +179,17 @@ Shards are suggested to stay under 500k rows and 500MB each. The spec does **not
 mandate a shard filename format — it only requires the shard set to stay stable, with
 the same batch of files overwritten each time.
 
+## If you want this running against your own store
+
+This feed is the worked example, not a product line. I build the same shape — a
+scheduled export against the Shopify Admin GraphQL API, with guards that refuse to
+publish rather than overwrite live data with a bad snapshot, and a test suite you can
+run before trusting any of it — as a fixed-price job:
+[hello532.github.io/services.html](https://hello532.github.io/services.html), or
+coolun.337@gmail.com. The "Verified / not verified" section above is the same standard
+you would get in writing for your own job. Issues and PRs here are welcome either way;
+nothing in this repository needs paying for.
+
 ## Licence
 
 MIT
